@@ -1,0 +1,15 @@
+configs
+program/__pycache__
+program/semantic/__pycache__
+tests/semantic/__pycache__/
+.venv
+.pytest_cache
+
+program/Compiscript.interp
+program/Compiscript.tokens
+program/CompiscriptLexer.interp
+program/CompiscriptLexer.py
+program/CompiscriptLexer.tokens
+program/CompiscriptListener.py
+program/CompiscriptParser.py
+program/CompiscriptVisitor.py
