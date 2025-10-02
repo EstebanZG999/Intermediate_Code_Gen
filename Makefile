@@ -84,7 +84,7 @@ lint-b: docker-build
 
 ide: docker-build gen
 	docker run --rm -it -p 8501:8501 \
-	  -v "$(PROJECT_ROOT)":/workspace -w /workspace/program/semantic $(DOCKER_IMAGE) \
+	  -v "$(PROJECT_ROOT)":/workspace -w /workspace/program/ide $(DOCKER_IMAGE) \
 	  bash -lc '\
 	    export PYTHONPATH=/workspace:/workspace/program && \
 	    streamlit run app.py --server.port=8501 --server.address=0.0.0.0 \
