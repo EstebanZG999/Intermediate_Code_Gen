@@ -265,4 +265,141 @@ class TACBuilder:
             if expr.is_temp and isinstance(expr.value, Temp):
                 self.tmps.free(expr.value)
         else:
-            self.tac.emit("ret")
+            self.tac.emit("ret", Const(None))
+
+    # ============================
+    # FUNCIONES Y LLAMADAS (Persona C)
+    # ============================
+
+    def gen_fn_begin(self, fname: str, has_this: bool = False, params: list[str] | None = None) -> None:
+        """
+        Marca la entrada de una función.
+        Nota: 'has_this' y 'params' son informativos para el futuro; el TAC base solo necesita la etiqueta.
+        """
+        self.tac.label(Label(f"func_{fname}_entry"))
+
+    def gen_fn_end(self, fname: str) -> None:
+        """
+        Marca el punto de salida canónico de la función (útil si normalizas returns).
+        """
+        self.tac.label(Label(f"func_{fname}_end"))
+        self.tac.emit("ret", Const(None))
+
+    def gen_call(self, fname: str, args: list[ExprResult]) -> ExprResult:
+        """
+        Convención:
+          - Empaquetar argumentos en orden con 'param arg'
+          - Emitir 'call fname, nargs -> t_ret'
+          - Devolver ExprResult(t_ret, is_temp=True) para componer en expresiones
+        """
+        for a in args:
+            self.tac.emit("param", a.value)
+            # libera temporales de argumentos después de encolarlos
+            if a.is_temp and isinstance(a.value, Temp):
+                self.tmps.free(a.value)
+
+        tret = self.tmps.new()
+        self.tac.emit("call", Const(fname), Const(len(args)), tret)
+        return ExprResult(tret, is_temp=True)
+
+    def gen_stmt_expr(self, expr_res: ExprResult | None) -> None:
+        """
+        Permite emitir una 'expresión como statement'. Útil para llamadas cuyo retorno se ignora.
+        """
+        if expr_res and expr_res.is_temp and isinstance(expr_res.value, Temp):
+            self.tmps.free(expr_res.value)
+    
+    # ============================
+    # MEMORIA / ARREGLOS (Persona C)
+    # ============================
+
+    def gen_array_load(self, base_operand: Operand, idx_expr: ExprResult) -> ExprResult:
+        """
+        Carga: taddr = base[index]; tval = load(taddr)
+        IR esperado:
+          addr_index base, idx -> taddr
+          load taddr -> tval
+        """
+        taddr = self.tmps.new()
+        self.tac.emit("addr_index", base_operand, idx_expr.value, taddr)
+
+        tval = self.tmps.new()
+        self.tac.emit("load", taddr, None, tval)
+
+        # liberar temporales
+        if idx_expr.is_temp and isinstance(idx_expr.value, Temp):
+            self.tmps.free(idx_expr.value)
+        self.tmps.free(taddr)
+
+        return ExprResult(tval, is_temp=True)
+
+    def gen_array_store(self, base_operand: Operand, idx_expr: ExprResult, src_expr: ExprResult) -> None:
+        """
+        Almacenamiento: base[index] = src
+        IR esperado:
+          addr_index base, idx -> taddr
+          store src, taddr
+        """
+        taddr = self.tmps.new()
+        self.tac.emit("addr_index", base_operand, idx_expr.value, taddr)
+        self.tac.emit("store", src_expr.value, taddr)
+
+        # liberar temporales
+        if idx_expr.is_temp and isinstance(idx_expr.value, Temp):
+            self.tmps.free(idx_expr.value)
+        if src_expr.is_temp and isinstance(src_expr.value, Temp):
+            self.tmps.free(src_expr.value)
+        self.tmps.free(taddr)
+
+    def gen_expr_index(self, base_var_name: str, idx_expr: ExprResult) -> ExprResult:
+        """
+        Azúcar: devuelve el valor de base[idx] como ExprResult.
+        Uso típico en expresiones: x = a[i] + 1;
+        """
+        return self.gen_array_load(Var(base_var_name), idx_expr)
+
+    def gen_stmt_assign_index(self, base_var_name: str, idx_expr: ExprResult, src_expr: ExprResult) -> None:
+        """
+        Azúcar: statement de asignación a[i] = v;
+        Uso típico en LHS indexado.
+        """
+        self.gen_array_store(Var(base_var_name), idx_expr, src_expr)
+
+    # ============================
+    # OBJETOS / CAMPOS (Persona C)
+    # ============================
+
+    def gen_field_load(self, base_operand: Operand, field_offset: int) -> ExprResult:
+        """
+        Lee base.campo
+        IR:
+          addr_field base, offset -> taddr
+          load taddr -> tval
+        """
+        taddr = self.tmps.new()
+        self.tac.emit("addr_field", base_operand, Const(field_offset), taddr)
+        tval = self.tmps.new()
+        self.tac.emit("load", taddr, None, tval)
+        self.tmps.free(taddr)
+        return ExprResult(tval, is_temp=True)
+
+    def gen_field_store(self, base_operand: Operand, field_offset: int, src_expr: ExprResult) -> None:
+        """
+        Escribe base.campo = src
+        IR:
+          addr_field base, offset -> taddr
+          store src, taddr
+        """
+        taddr = self.tmps.new()
+        self.tac.emit("addr_field", base_operand, Const(field_offset), taddr)
+        self.tac.emit("store", src_expr.value, taddr)
+        if src_expr.is_temp and isinstance(src_expr.value, Temp):
+            self.tmps.free(src_expr.value)
+        self.tmps.free(taddr)
+
+    # Azúcar: this.campo
+    def gen_this_field_load(self, field_offset: int) -> ExprResult:
+        return self.gen_field_load(Var("this"), field_offset)
+
+    def gen_this_field_store(self, field_offset: int, src_expr: ExprResult) -> None:
+        self.gen_field_store(Var("this"), field_offset, src_expr)
