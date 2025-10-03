@@ -1,5 +1,5 @@
-from semantic.scopes import Scope, ScopeStack
-from semantic.symbols import Symbol, VarSymbol, ParamSymbol, FuncSymbol, ClassSymbol
+from program.semantic.scopes import Scope, ScopeStack
+from program.semantic.symbols import Symbol, VarSymbol, ParamSymbol, FuncSymbol, ClassSymbol
 
 def print_scope(scope: Scope, indent=0):
     pad = "  " * indent
