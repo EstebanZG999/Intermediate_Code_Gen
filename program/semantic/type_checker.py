@@ -1,16 +1,17 @@
-from semantic.typesys import make_fn, FunctionType
-from semantic.scopes import GlobalScope, ScopeStack
-from semantic.symbols import VarSymbol, FuncSymbol, ClassSymbol, ParamSymbol
-from semantic.typesys import (
+from program.semantic.typesys import make_fn, FunctionType
+from program.semantic.scopes import GlobalScope, ScopeStack
+from program.semantic.symbols import VarSymbol, FuncSymbol, ClassSymbol, ParamSymbol
+from program.semantic.typesys import (
     Type, INTEGER, STRING, BOOLEAN, VOID, NULL,
     ArrayType,   
     can_assign, arithmetic_type, logical_type, comparison_type,
-    make_array
+    make_array, plus_type, arith_type, relational_type, equality_type, is_array,
+    element_type,
 )
 
-from semantic.error_reporter import ErrorReporter
-from CompiscriptVisitor import CompiscriptVisitor
-from CompiscriptParser import CompiscriptParser
+from program.semantic.error_reporter import ErrorReporter
+from program.CompiscriptVisitor import CompiscriptVisitor
+from program.CompiscriptParser import CompiscriptParser
 from contextlib import contextmanager
 
 class TypeChecker(CompiscriptVisitor):
@@ -103,6 +104,11 @@ class TypeChecker(CompiscriptVisitor):
             while isinstance(class_sym, ClassSymbol):
                 field = class_sym.fields.get(prop_name) if hasattr(class_sym, "fields") else None
                 if field:
+                    # const field no reasignable
+                    if getattr(field, "is_const", False):
+                        self.reporter.report(ctx.start.line, ctx.start.column, "E_CONST",
+                                            f"No se puede asignar a la constante de clase '{prop_name}'")
+                        return field.type
                     # Verificar asignabilidad
                     if not can_assign(field.type, value_t):
                         self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
@@ -125,12 +131,21 @@ class TypeChecker(CompiscriptVisitor):
             sym = self.resolve_symbol(name, ctx.start.line, ctx.start.column)
             target_t = (sym.type if sym else VOID) or VOID
 
-            expr_node = exprs[0] if isinstance(exprs, list) else exprs
-            value_t = self.visit(expr_node) or VOID
+            # const variable no reasignable
+            if isinstance(sym, VarSymbol) and sym.is_const:
+                self.reporter.report(ctx.start.line, ctx.start.column, "E_CONST",
+                                    f"No se puede asignar a la constante '{name}'")
+            else:
+                expr_node = exprs[0] if isinstance(exprs, list) else exprs
+                value_t = self.visit(expr_node) or VOID
 
-            if not can_assign(target_t, value_t):
-                self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
-                                    f"No se puede asignar {value_t} a {target_t}")
+                if not can_assign(target_t, value_t):
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
+                                        f"No se puede asignar {value_t} a {target_t}")
+                else:
+                    # NUEVO: marcar inicializada la variable
+                    if isinstance(sym, VarSymbol):
+                        sym.is_initialized = True
             return target_t
 
 
@@ -211,36 +226,80 @@ class TypeChecker(CompiscriptVisitor):
             ret_t = self.visit(ctx.expression()) or VOID
         return ret_t
 
-
     def visitAdditiveExpr(self, ctx: CompiscriptParser.AdditiveExprContext):
+        # patrón: term (('+'|'-') term)*
         t = self.visit(ctx.multiplicativeExpr(0)) or VOID
-        for m in ctx.multiplicativeExpr()[1:]:
-            right_t = self.visit(m) or VOID
-            t = arithmetic_type(t, right_t) or VOID
+        n = len(ctx.multiplicativeExpr())
+        # operadores están en posiciones impares de getChildren()
+        # o puedes contar: hay n-1 operadores
+        child_i = 1  # primer operador está en child 1
+        for i in range(1, n):
+            op = ctx.getChild(child_i).getText()  # '+' o '-'
+            right_t = self.visit(ctx.multiplicativeExpr(i)) or VOID
+            if op == "+":
+                t2 = plus_type(t, right_t)
+            else:
+                t2 = arith_type(t, right_t)
+            if t2 is None:
+                self.reporter.report(ctx.start.line, ctx.start.column, "E_ARITH",
+                                    f"Operación inválida: {t} {op} {right_t}")
+                return VOID
+            t = t2
+            child_i += 2
         return t
 
     def visitMultiplicativeExpr(self, ctx: CompiscriptParser.MultiplicativeExprContext):
+        # patrón: factor (('*'|'/'|'%') factor)*
         t = self.visit(ctx.unaryExpr(0)) or VOID
-        for u in ctx.unaryExpr()[1:]:
-            right_t = self.visit(u) or VOID
-            t = arithmetic_type(t, right_t) or VOID
+        n = len(ctx.unaryExpr())
+        child_i = 1
+        for i in range(1, n):
+            op = ctx.getChild(child_i).getText()
+            right_t = self.visit(ctx.unaryExpr(i)) or VOID
+            t2 = arith_type(t, right_t)
+            if t2 is None:
+                self.reporter.report(ctx.start.line, ctx.start.column, "E_ARITH",
+                                    f"Operación inválida: {t} {op} {right_t}")
+                return VOID
+            t = t2
+            child_i += 2
         return t
 
     def visitRelationalExpr(self, ctx: CompiscriptParser.RelationalExprContext):
+        # patrón: additive (('<'|'<='|'>'|'>=') additive)*
         if ctx.additiveExpr():
             t = self.visit(ctx.additiveExpr(0)) or VOID
-            for a in ctx.additiveExpr()[1:]:
-                right_t = self.visit(a) or VOID
-                t = comparison_type(t, right_t) or VOID
+            n = len(ctx.additiveExpr())
+            child_i = 1
+            for i in range(1, n):
+                op = ctx.getChild(child_i).getText()
+                right_t = self.visit(ctx.additiveExpr(i)) or VOID
+                t2 = relational_type(t, right_t)
+                if t2 is None:
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_REL",
+                                        f"Operación relacional inválida: {t} {op} {right_t}")
+                    return VOID
+                t = t2  # sigue siendo BOOLEAN si llegó aquí
+                child_i += 2
             return t
         return VOID
 
     def visitEqualityExpr(self, ctx: CompiscriptParser.EqualityExprContext):
+        # patrón: relational (('=='|'!=') relational)*
         if ctx.relationalExpr():
             t = self.visit(ctx.relationalExpr(0)) or VOID
-            for r in ctx.relationalExpr()[1:]:
-                right_t = self.visit(r) or VOID
-                t = comparison_type(t, right_t) or VOID
+            n = len(ctx.relationalExpr())
+            child_i = 1
+            for i in range(1, n):
+                op = ctx.getChild(child_i).getText()
+                right_t = self.visit(ctx.relationalExpr(i)) or VOID
+                t2 = equality_type(t, right_t)
+                if t2 is None:
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_EQ",
+                                        f"Comparación inválida: {t} {op} {right_t}")
+                    return VOID
+                t = t2  # BOOLEAN
+                child_i += 2
             return t
         return VOID
 
@@ -249,7 +308,12 @@ class TypeChecker(CompiscriptVisitor):
             t = self.visit(ctx.equalityExpr(0)) or VOID
             for e in ctx.equalityExpr()[1:]:
                 right_t = self.visit(e) or VOID
-                t = logical_type(t, right_t) or VOID
+                t2 = logical_type(t, right_t)  # ya valida boolean && boolean
+                if t2 is None:
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_LOGIC",
+                                        f"Operación lógica inválida: {t} && {right_t}")
+                    return VOID
+                t = t2
             return t
         return VOID
 
@@ -375,7 +439,11 @@ class TypeChecker(CompiscriptVisitor):
 
         sym = self.resolve_symbol(name, ctx.start.line, ctx.start.column)
         if sym:
-            if isinstance(sym, (VarSymbol, ParamSymbol)):
+            if isinstance(sym, VarSymbol):
+                # uso antes de inicializar
+                if not sym.is_initialized and not sym.is_const:
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_UNINIT",
+                                        f"Variable '{name}' usada antes de ser inicializada")
                 return sym.type
             if isinstance(sym, FuncSymbol):
                 return sym.type  
@@ -604,12 +672,12 @@ class TypeChecker(CompiscriptVisitor):
 
     def visitForeachStatement(self, ctx: CompiscriptParser.ForeachStatementContext):
         iter_t = self.visit(ctx.expression()) or VOID
-        if not isinstance(iter_t, Type) or not iter_t.name.endswith("[]"):
+        if not is_array(iter_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_FOREACH",
                                 f"foreach requiere un arreglo, no {iter_t}")
             elem_t = VOID
         else:
-            elem_t = Type(iter_t.name[:-2])
+            elem_t = element_type(iter_t) or VOID
 
         var_name = ctx.Identifier().getText()
         sym = VarSymbol(var_name, elem_t, is_const=False, is_initialized=True,
@@ -617,7 +685,7 @@ class TypeChecker(CompiscriptVisitor):
         self.define_symbol(sym)
 
         self.scopes.push("loop")
-        self.visit(ctx.block())  # BlockScope dentro del loop
+        self.visit(ctx.block())
         self.scopes.pop()
         return None
 
@@ -677,12 +745,12 @@ class TypeChecker(CompiscriptVisitor):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"Índice debe ser integer, no {idx_t}")
 
-        if not isinstance(arr_t, Type) or not arr_t.name.endswith("[]"):
+        if not is_array(arr_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"El objeto {arr_t} no es indexable")
             return VOID
 
-        elem_t = Type(arr_t.name[:-2])  
+        elem_t = element_type(arr_t) or VOID
         return elem_t
 
     def visitUnaryExpr(self, ctx: CompiscriptParser.UnaryExprContext):
@@ -735,11 +803,27 @@ class TypeChecker(CompiscriptVisitor):
 
     def visitAssignmentExpr(self, ctx: CompiscriptParser.AssignmentExprContext):
         if ctx.getChildCount() == 3 and ctx.getChild(1).getText() == "=":
-            lhs_t = self.visit(ctx.leftHandSide()) or VOID
+            # Intentar detectar si lhs es un identificador simple para chequear const
+            lhs = ctx.leftHandSide()
+            lhs_id = None
+            if lhs and lhs.primaryAtom() and lhs.primaryAtom().Identifier():
+                lhs_id = lhs.primaryAtom().Identifier().getText()
+            lhs_t = self.visit(lhs) or VOID
             rhs_t = self.visit(ctx.assignmentExpr()) or VOID
+
+            # const en asignación expresiva
+            if lhs_id is not None:
+                sym = self.resolve_symbol(lhs_id, ctx.start.line, ctx.start.column)
+                if isinstance(sym, VarSymbol) and sym.is_const:
+                    self.reporter.report(ctx.start.line, ctx.start.column, "E_CONST",
+                                        f"No se puede asignar a la constante '{lhs_id}'")
+                else:
+                    if isinstance(sym, VarSymbol):
+                        sym.is_initialized = True
+
             if not can_assign(lhs_t, rhs_t):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
-                                     f"No se puede asignar {rhs_t} a {lhs_t}")
+                                    f"No se puede asignar {rhs_t} a {lhs_t}")
             return lhs_t
         else:
             return self.visit(ctx.conditionalExpr()) or VOID
