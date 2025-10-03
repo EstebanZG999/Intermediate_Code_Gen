@@ -2,3 +2,4 @@ antlr4-python3-runtime==4.13.0
 pytest
 streamlit==1.37.1
 graphviz
+pytest-snapshot

@@ -2,9 +2,9 @@ import sys
 from antlr4 import *
 from CompiscriptLexer import CompiscriptLexer
 from CompiscriptParser import CompiscriptParser
-from semantic.type_checker import TypeChecker
-from semantic.error_reporter import ErrorReporter
-from semantic.table import print_symbol_table   
+from program.semantic.type_checker import TypeChecker
+from program.semantic.error_reporter import ErrorReporter
+from program.semantic.table import print_symbol_table
 
 
 def main(argv):
