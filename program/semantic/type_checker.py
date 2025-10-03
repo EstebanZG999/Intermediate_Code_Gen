@@ -14,6 +14,10 @@ from program.CompiscriptVisitor import CompiscriptVisitor
 from program.CompiscriptParser import CompiscriptParser
 from contextlib import contextmanager
 
+from program.runtime.activation_record import ActivationRecord
+from program.semantic.symbols import VarSymbol, ParamSymbol, FuncSymbol, ClassSymbol
+from program.semantic.table import SymbolTable
+
 class TypeChecker(CompiscriptVisitor):
     def __init__(self, reporter: ErrorReporter):
         super().__init__()
@@ -21,6 +25,12 @@ class TypeChecker(CompiscriptVisitor):
         self.scopes = ScopeStack()
         self.scopes.push("global")   # GLOBAL AQUI
         self._current_class: str | None = None
+        try:
+            self.symtab
+        except AttributeError:
+            from program.semantic.scopes import ScopeStack
+            self.scopes = getattr(self, "scopes", ScopeStack())
+            self.symtab = SymbolTable(self.scopes)
 
     def define_symbol(self, sym):
         if not self.scopes.stack:
@@ -172,6 +182,7 @@ class TypeChecker(CompiscriptVisitor):
         )
         self.define_symbol(func_sym)
 
+        # Registrar funciones anidadas (tu lógica original)
         parent_scope = self.scopes.current
         if hasattr(parent_scope, "func_name") and parent_scope.func_name:
             parent_sym = self.resolve_symbol(parent_scope.func_name)
@@ -180,10 +191,20 @@ class TypeChecker(CompiscriptVisitor):
                     parent_sym.nested = {}
                 parent_sym.nested[name] = func_sym
 
+        # PUSH del scope de función
         self.scopes.push_function(ret_type, name)
+
+        # Capturamos el scope de función "real"
+        func_scope = self.scopes.current
+
+        # Definir símbolos de parámetros en el scope de función (como haces hoy)
         for psym in params:
             self.define_symbol(psym)
 
+        # Crear RA y asignar offsets a THIS (si aplica) + PARÁMETROS
+        self._begin_function_layout(func_sym, func_scope)
+
+        # Visitar cuerpo: tus locales se declaran aquí dentro (en un BlockScope)
         returns = []
         has_terminated = False
         with self._block():
@@ -198,6 +219,10 @@ class TypeChecker(CompiscriptVisitor):
                     returns.append(r or VOID)
                     has_terminated = True
 
+        # Tras visitar el cuerpo, asignar offsets a LOCALES
+        self._finalize_function_layout(func_sym, func_scope)
+
+        # POP del scope de función
         self.scopes.pop()
 
         if not returns and ret_type != VOID:
@@ -210,6 +235,103 @@ class TypeChecker(CompiscriptVisitor):
                                     f"Return {rt} incompatible con {ret_type}")
 
         return None
+
+    def _begin_function_layout(self, func_sym: FuncSymbol, func_scope):
+        """
+        Crea el ActivationRecord y registra THIS (si aplica) + PARÁMETROS (con offsets).
+        Si no existe un VarSymbol para el parámetro, crea uno 'sombra' para poder usar addr_of en TAC.
+        """
+        ar = ActivationRecord(func_name=func_sym.name)
+
+        # (1) THIS si es método de clase
+        if self._is_method(func_sym, func_scope):
+            ar.add_this()
+            # si modelas 'this' como VarSymbol en el scope, opcionalmente sincroniza:
+            if "this" in getattr(func_scope, "symbols", {}) or "this" in func_scope:
+                vs = func_scope["this"]
+                if isinstance(vs, VarSymbol):
+                    slot = ar.addr_of("this")
+                    if slot:
+                        vs.offset = slot.offset
+                        vs.region = "this"
+
+        # (2) Parámetros en orden
+        for p in func_sym.params:
+            ar.add_param(p.name)
+            # Buscar un VarSymbol homónimo en el scope de función
+            vs = None
+            if hasattr(func_scope, "get"):
+                vs = func_scope.get(p.name, None)
+            else:
+                # si tu Scope es dict-like
+                vs = func_scope.symbols.get(p.name) if hasattr(func_scope, "symbols") else None
+
+            if isinstance(vs, VarSymbol):
+                slot = ar.addr_of(p.name)
+                if slot:
+                    vs.offset = slot.offset
+                    vs.region = "param"
+            else:
+                # Crear una variable 'sombra' para TAC
+                vparam = VarSymbol(p.name, p.type, is_const=False, is_initialized=True)
+                slot = ar.addr_of(p.name)
+                if slot:
+                    vparam.offset = slot.offset
+                    vparam.region = "param"
+                # insertar en el scope
+                if hasattr(func_scope, "define"):
+                    func_scope.define(vparam)
+                elif hasattr(func_scope, "insert"):
+                    func_scope.insert(p.name, vparam)
+                else:
+                    # fallback si func_scope es dict-like
+                    if hasattr(func_scope, "symbols"):
+                        func_scope.symbols[p.name] = vparam
+                    else:
+                        func_scope[p.name] = vparam
+
+        # Colgar el RA en el símbolo de función
+        func_sym.activation_record = ar
+
+
+    def _finalize_function_layout(self, func_sym: FuncSymbol, func_scope):
+        """
+        Tras visitar el cuerpo, asigna offsets a todas las variables locales (no param/this).
+        Observación: tus locales se suelen declarar dentro de un BlockScope; recógelos.
+        """
+        ar = func_sym.activation_record
+        if ar is None:
+            ar = ActivationRecord(func_name=func_sym.name)
+            func_sym.activation_record = ar
+
+        # 1) Asignar a locales del scope de función (si hay)
+        items_iter = []
+        if hasattr(func_scope, "items"):
+            items_iter = list(func_scope.items())
+        elif hasattr(func_scope, "symbols"):
+            items_iter = list(func_scope.symbols.items())
+
+        for name, sym in items_iter:
+            if isinstance(sym, VarSymbol) and sym.region not in ("param", "this"):
+                ar.add_local(name)
+                slot = ar.addr_of(name)
+                if slot:
+                    sym.offset = slot.offset
+                    sym.region = "local"
+
+    def _is_method(self, func_sym: FuncSymbol, func_scope) -> bool:
+        """
+        Heurística: estamos dentro de una clase si self._current_class no es None,
+        o si el scope padre es de tipo 'class'.
+        """
+        if self._current_class:
+            return True
+        # chequeo por parent scope si tu ScopeStack lo permite
+        if len(self.scopes.stack) >= 2:
+            parent = self.scopes.stack[-2]
+            if getattr(parent, "kind", "") == "class":
+                return True
+        return False
 
     def visitReturnStatement(self, ctx):
         # Validar que estemos dentro de una función
@@ -473,24 +595,37 @@ class TypeChecker(CompiscriptVisitor):
             if member.functionDeclaration():
                 fname = member.functionDeclaration().Identifier().getText()
                 ret_type = self.visit(member.functionDeclaration().type_()) if member.functionDeclaration().type_() else VOID
-                
+
                 params = []
                 if member.functionDeclaration().parameters():
                     for i, p in enumerate(member.functionDeclaration().parameters().parameter()):
                         pname = p.Identifier().getText()
                         ptype = self.visit(p.type_()) if p.type_() else VOID
                         params.append(ParamSymbol(pname, ptype, i,
-                                                line=p.start.line, col=p.start.column))
-                
+                                                 line=p.start.line, col=p.start.column))
+
                 func_type = make_fn([p.type for p in params], ret_type)
                 fsym = FuncSymbol(fname, type=func_type, params=tuple(params),
-                                line=member.start.line, col=member.start.column)
+                                  line=member.start.line, col=member.start.column)
                 csym.methods[fname] = fsym
 
+                # PUSH del scope de función del método
                 self.scopes.push_function(ret_type, fname)
+                func_scope = self.scopes.current
+
                 for psym in params:
                     self.define_symbol(psym)
+
+                # RA para método (detectará THIS por _is_method)
+                self._begin_function_layout(fsym, func_scope)
+
+                # Cuerpo del método
                 self.visit(member.functionDeclaration().block())
+
+                # Offsets de locales del método
+                self._finalize_function_layout(fsym, func_scope)
+
+                # POP del scope de función
                 self.scopes.pop()
 
             elif member.variableDeclaration():
@@ -507,6 +642,18 @@ class TypeChecker(CompiscriptVisitor):
                 csym.fields[cname] = VarSymbol(cname, ctype, is_const=True, is_initialized=True,
                                             line=member.start.line, col=member.start.column)
                 self.define_symbol(csym.fields[cname])
+
+        # Calcula el desplazamiento base por herencia
+        base_field_count = 0
+        if csym.base:
+            base_sym = self.resolve_symbol(csym.base, ctx.start.line, ctx.start.column)
+            if isinstance(base_sym, ClassSymbol):
+                base_field_count = len(base_sym.fields)
+
+        # Asigna field_offset a los campos de ESTA clase por orden de declaración
+        for i, (fname, fsym) in enumerate(csym.fields.items()):
+            if isinstance(fsym, VarSymbol):
+                fsym.field_offset = base_field_count + i
 
         self.scopes.pop()
         self._current_class = prev
