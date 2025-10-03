@@ -109,3 +109,59 @@ def comparison_type(lhs: Type, rhs: Type) -> Optional[Type]:
     if is_numeric(lhs) and is_numeric(rhs):
         return BOOLEAN
     return None
+
+def is_array(t: Type) -> bool:
+    return isinstance(t, ArrayType)
+
+def element_type(t: Type) -> Optional[Type]:
+    return t.elem if isinstance(t, ArrayType) else None
+
+def plus_type(lhs: Type, rhs: Type) -> Optional[Type]:
+    """
+    Reglas SOLO para '+':
+      - integer + integer -> integer
+      - string + string -> string
+      - string + integer / integer + string -> string (concatenación)
+    """
+    if is_numeric(lhs) and is_numeric(rhs):
+        return INTEGER
+    if is_string(lhs) and is_string(rhs):
+        return STRING
+    if (is_string(lhs) and is_numeric(rhs)) or (is_numeric(lhs) and is_string(rhs)):
+        return STRING
+    return None
+
+def arith_type(lhs: Type, rhs: Type) -> Optional[Type]:
+    """
+    Reglas para '-', '*', '/', '%': solo integer con integer.
+    """
+    if is_numeric(lhs) and is_numeric(rhs):
+        return INTEGER
+    return None
+
+def relational_type(lhs: Type, rhs: Type) -> Optional[Type]:
+    """
+    Reglas para '<', '<=', '>', '>=': solo numéricos.
+    """
+    if is_numeric(lhs) and is_numeric(rhs):
+        return BOOLEAN
+    return None
+
+def equality_type(lhs: Type, rhs: Type) -> Optional[Type]:
+    """
+    Reglas para '==' y '!=':
+    - Tipos iguales -> boolean
+    - (Opcional) null con referencias (array, class, string) -> boolean
+    """
+    if equal_types(lhs, rhs):
+        return BOOLEAN
+    # permitir comparar con null referencias válidas
+    if (is_array(lhs) or isinstance(lhs, ClassType) or is_string(lhs)) and rhs == NULL:
+        return BOOLEAN
+    if (is_array(rhs) or isinstance(rhs, ClassType) or is_string(rhs)) and lhs == NULL:
+        return BOOLEAN
+    # numérico con numérico distintos no debería llegar aquí con equal_types,
+    # pero por claridad:
+    if is_numeric(lhs) and is_numeric(rhs):
+        return BOOLEAN
+    return None
