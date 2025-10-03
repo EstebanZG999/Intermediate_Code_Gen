@@ -1,8 +1,8 @@
 import pytest
 
-from semantic.scopes import Scope, GlobalScope, FunctionScope, ClassScope
-from semantic.symbols import VarSymbol
-import semantic.typesys as T
+from program.semantic.scopes import Scope, GlobalScope, FunctionScope, ClassScope
+from program.semantic.symbols import VarSymbol
+import program.semantic.typesys as T
 
 Int = T.INTEGER
 

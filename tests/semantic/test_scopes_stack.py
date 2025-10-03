@@ -1,5 +1,5 @@
-import semantic.typesys as T
-from semantic.scopes import GlobalScope, ScopeStack, FunctionScope, ClassScope
+import program.semantic.typesys as T
+from program.semantic.scopes import GlobalScope, ScopeStack, FunctionScope, ClassScope
 
 def test_stack_helpers_for_function_and_class():
     st = ScopeStack(GlobalScope())
