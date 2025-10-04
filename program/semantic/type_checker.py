@@ -23,14 +23,9 @@ class TypeChecker(CompiscriptVisitor):
         super().__init__()
         self.reporter = reporter
         self.scopes = ScopeStack()
-        self.scopes.push("global")   # GLOBAL AQUI
+        self.scopes.push("global")
         self._current_class: str | None = None
-        try:
-            self.symtab
-        except AttributeError:
-            from program.semantic.scopes import ScopeStack
-            self.scopes = getattr(self, "scopes", ScopeStack())
-            self.symtab = SymbolTable(self.scopes)
+        self.symtab = SymbolTable(self.scopes)
 
     def define_symbol(self, sym):
         if not self.scopes.stack:
@@ -566,6 +561,8 @@ class TypeChecker(CompiscriptVisitor):
                 if not sym.is_initialized and not sym.is_const:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_UNINIT",
                                         f"Variable '{name}' usada antes de ser inicializada")
+                return sym.type
+            if isinstance(sym, ParamSymbol):
                 return sym.type
             if isinstance(sym, FuncSymbol):
                 return sym.type  
