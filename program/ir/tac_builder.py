@@ -265,7 +265,7 @@ class TACBuilder:
             if expr.is_temp and isinstance(expr.value, Temp):
                 self.tmps.free(expr.value)
         else:
-            self.tac.emit("ret", Const(None))
+            self.tac.emit("ret")
 
     # ============================
     # FUNCIONES Y LLAMADAS (Persona C)
