@@ -9,7 +9,13 @@ from semantic.type_checker import TypeChecker
 from semantic.error_reporter import ErrorReporter
 from semantic.scopes import GlobalScope
 from semantic.symbols import FuncSymbol, ClassSymbol, VarSymbol
+from ir.tac_builder import TACBuilder
+from ir.tac_gen import TACGen
+from semantic.table import SymbolTable
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 # --- Graphviz helpers ---
 def _node_label(parser, node) -> str:
@@ -194,6 +200,7 @@ with col_a:
     do_compile = st.button("Compile 🚀", key="compile_main")
 with col_b:
     show_tree = st.checkbox("Árbol sintáctico", value=True)
+    show_tac  = st.checkbox("Generar TAC", value=True)
 with col_c:
     max_nodes = st.slider("Límite de nodos del árbol", min_value=200, max_value=5000, value=2000, step=100)
 
@@ -211,6 +218,17 @@ if do_compile:
         st.subheader("Árbol sintáctico")
         dot = build_parse_tree_dot(parser, tree, max_nodes=max_nodes)
         st.graphviz_chart(dot, use_container_width=True)
+    
+    # Generación de TAC (solo si no hay errores)
+    if show_tac and not reporter.has_errors():
+        st.subheader("TAC")
+        # Usamos la tabla de símbolos a partir de 'scopes'
+        symtab  = SymbolTable(scopes)
+        builder = TACBuilder()
+        gen     = TACGen(symtab, builder)
+        gen.visit(tree)
+        tac_text = "\n".join(str(instr) for instr in builder.tac.code)
+        st.code(tac_text, language="text")
 
     # Tabla de símbolos por scope
     for scope in scopes.stack:
