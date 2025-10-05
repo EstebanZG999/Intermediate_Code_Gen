@@ -172,39 +172,51 @@ class TACGen(CompiscriptVisitor):
     def visitCallExpr(self, ctx):
         """
         Traduce:
-        - foo(args)
-        - obj.metodo(args)
+        - foo(args)               → llamada normal
+        - obj.metodo(args)        → llamada a método con this
         """
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 args.append(self.visit(e))
 
-        # Determinar si es llamada a método (obj.metodo)
-        lhs = ctx.parentCtx.primaryAtom()
-        if lhs and lhs.Identifier():
-            fname = lhs.Identifier().getText()
+        # Determinar si es una llamada de la forma obj.metodo(args)
+        lhs_ctx = ctx.parentCtx
+        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom():
+            atom = lhs_ctx.primaryAtom()
 
-            # Caso método: p.saludar()
-            if "." in fname:
-                obj_name, method_name = fname.split(".", 1)
-                obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
-                if isinstance(obj_sym, VarSymbol):
-                    obj_type = obj_sym.type.name
-                    # Pasar this + args
-                    self.b.tac.emit("param", Var(obj_name))
-                    for a in args:
-                        self.b.tac.emit("param", a.value)
-                    tret = self.b.tmps.new()
-                    self.b.tac.emit("call", Const(f"{obj_type}.{method_name}"), Const(len(args)+1), tret)
-                    return ExprResult(tret, is_temp=True)
+            # Caso: obj.metodo(args)
+            if hasattr(atom, "leftHandSide") and atom.leftHandSide():
+                lhs = atom.leftHandSide()
+                if lhs.getChildCount() >= 3 and lhs.getChild(1).getText() == '.':
+                    obj_name = lhs.getChild(0).getText()
+                    method_name = lhs.getChild(2).getText()
 
-            # Caso función normal
-            tret = self.b.gen_call(fname, args)
-            return tret
+                    # Resuelve tipo del objeto
+                    obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+                    if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name"):
+                        obj_type = obj_sym.type.name
+                        # Emitir this (objeto) y los argumentos
+                        self.b.tac.emit("param", Var(obj_name))
+                        for a in args:
+                            self.b.tac.emit("param", a.value)
+                        tmp = self.b.tmps.new()
+                        self.b.tac.emit("call", Const(f"{obj_type}.{method_name}"), Const(len(args) + 1), tmp)
+                        return ExprResult(tmp, is_temp=True)
 
+        # Caso: foo(args) — llamada normal a función global
+        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
+            func_name = lhs_ctx.primaryAtom().Identifier().getText()
+            for a in args:
+                self.b.tac.emit("param", a.value)
+            tmp = self.b.tmps.new()
+            self.b.tac.emit("call", Const(func_name), Const(len(args)), tmp)
+            return ExprResult(tmp, is_temp=True)
+
+        # Fallback
         return self.b.gen_expr_literal(0)
 
+ 
  
     # ---------- Statements ----------
     def visitVariableDeclaration(self, ctx):

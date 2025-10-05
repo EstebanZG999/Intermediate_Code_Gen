@@ -1,17 +1,20 @@
 import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import streamlit as st
 from antlr4 import InputStream, CommonTokenStream
 from antlr4.tree.Trees import Trees
-from CompiscriptLexer import CompiscriptLexer
-from CompiscriptParser import CompiscriptParser
-from semantic.type_checker import TypeChecker
-from semantic.error_reporter import ErrorReporter
-from semantic.scopes import GlobalScope
-from semantic.symbols import FuncSymbol, ClassSymbol, VarSymbol
-from ir.tac_builder import TACBuilder
-from ir.tac_gen import TACGen
-from semantic.table import SymbolTable
+
+from program.CompiscriptLexer import CompiscriptLexer
+from program.CompiscriptParser import CompiscriptParser
+from program.semantic.type_checker import TypeChecker
+from program.semantic.error_reporter import ErrorReporter
+from program.semantic.scopes import GlobalScope
+from program.semantic.symbols import FuncSymbol, ClassSymbol, VarSymbol
+from program.semantic.table import SymbolTable
+from program.ir.tac_builder import TACBuilder
+from program.ir.tac_gen import TACGen
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if ROOT not in sys.path:
