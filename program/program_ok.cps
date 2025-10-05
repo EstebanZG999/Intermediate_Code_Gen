@@ -1,37 +1,50 @@
-// Constantes y variables
+// === Variables globales ===
 const PI: integer = 314;
-let saludo: string = "Hola mundo!";
-let activo: boolean = true;
-let numeros: integer[] = [1, 2, 3, 4, 5];
+let mensaje: string = "Hola Mundo";
 
-// Función que multiplica dos enteros
-function multiplicar(a: integer, b: integer): integer {
-  return a * b;
+// === Función simple ===
+function cuadrado(x: integer): integer {
+  return x * x;
 }
 
-let resultado: integer = multiplicar(6, 7);
-print("El resultado es: " + resultado);
-
-// Control de flujo simple
-if (resultado > 10) {
-  print("Mayor que 10");
-} else {
-  print("Menor o igual a 10");
+// === Función anidada ===
+function externo(a: integer): integer {
+  function interno(b: integer): integer {
+    return a + b;
+  }
+  return interno(5);
 }
 
-// Clase sencilla
+// === Clase con campos y método ===
 class Persona {
   let nombre: string;
+  let edad: integer;
 
-  function constructor(nombre: string) {
-    this.nombre = nombre;
+  function constructor(n: string, e: integer): void {
+    this.nombre = n;
+    this.edad = e;
   }
 
-  function saludar(): string {
-    return "Hola, soy " + this.nombre;
+  function saludar(): void {
+    print("Hola, soy " + this.nombre);
   }
 }
 
-// Crear instancia y usar método
-let p: Persona = new Persona("Carlos");
-print(p.saludar());
+// === Arreglos y bucles ===
+function promedio(valores: integer[]): integer {
+  let suma: integer = 0;
+  for (let i: integer = 0; i < 3; i = i + 1) {
+    suma = suma + valores[i];
+  }
+  return suma / 3;
+}
+
+// === Programa principal ===
+let resultado: integer = externo(10);
+print("Resultado externo: " + resultado);
+
+let p: Persona = new Persona("Oscar", 25);
+p.saludar();
+
+let nums: integer[] = [10, 20, 30];
+print("Promedio: " + promedio(nums));

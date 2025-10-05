@@ -464,11 +464,23 @@ class TypeChecker(CompiscriptVisitor):
 
         # llamada simple:  Identifier '(' args ')'    (no hay más suffixes)
         if len(lhs_ctx.suffixOp()) == 1 and lhs_ctx.suffixOp(0) == ctx and base_name is not None:
+            # --- Búsqueda extendida: soporta funciones anidadas ---
             sym = self.resolve_symbol(base_name, ctx.start.line, ctx.start.column)
+
+            # Si no se encontró con resolve_symbol, busca manualmente en la cadena de scopes
+            if not sym:
+                for scope in reversed(self.scopes.stack):
+                    table = getattr(scope, "symbols", None)
+                    if table and base_name in table and isinstance(table[base_name], FuncSymbol):
+                        sym = table[base_name]
+                        break
+
+            # Validar que sea realmente una función
             if not sym or not isinstance(sym, FuncSymbol):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                    f"{base_name} no es una función")
+                                    f"{base_name} no es una función válida o visible en este contexto")
                 return VOID
+
 
             # Si la función captura un scope
             pushed = False

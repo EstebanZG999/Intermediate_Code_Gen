@@ -104,14 +104,42 @@ class TACGen(CompiscriptVisitor):
             base = self.visit(s)  # cada suffix devuelve ExprResult
         return base
 
+    def visitNewExpr(self, ctx):
+        """
+        Traduce: new Clase(args)
+        Genera una llamada al constructor si existe.
+        """
+        class_name = ctx.Identifier().getText()
+        args = []
+        if ctx.arguments():
+            for e in ctx.arguments().expression():
+                args.append(self.visit(e))
+
+        # Reservar memoria simbólicamente para el objeto
+        temp_obj = self.b.tmps.new()
+        self.b.tac.emit("alloc", Const(class_name), None, temp_obj)
+
+        # Buscar constructor y generar llamada
+        cls = self.symtab._resolve_class(class_name)
+        if cls and "constructor" in cls.methods:
+            ctor = cls.methods["constructor"]
+            params = [ExprResult(Var("this"), False)] + args
+            # Pasar 'this' + args al constructor
+            self.b.tac.emit("param", temp_obj)
+            for a in args:
+                self.b.tac.emit("param", a.value)
+            self.b.tac.emit("call", Const(f"{class_name}.constructor"), Const(len(args)+1))
+        
+        return ExprResult(temp_obj, is_temp=True)
+
+
+
     def visitPropertyAccessExpr(self, ctx):
-        # parent LHS contiene el objeto en primaryAtom()
         lhs_ctx = ctx.parentCtx
         obj_expr = self.visit(lhs_ctx.primaryAtom())
         field_name = ctx.Identifier().getText()
 
-        # Necesitamos el tipo del objeto; en un compilador “real”
-        # lo obtendrías desde semántica. Aquí: asumimos Var(name) y consultamos symtab.
+        # Obtener tipo del objeto
         if isinstance(obj_expr.value, Var):
             var_sym = self.symtab.scope_stack.current.resolve(obj_expr.value.name)
             obj_type_name = var_sym.type.name if isinstance(var_sym, VarSymbol) else None
@@ -121,9 +149,16 @@ class TACGen(CompiscriptVisitor):
         if obj_type_name is None:
             return self.b.gen_expr_literal(0)
 
+        # --- NUEVO BLOQUE: si es método, no pidas field_offset ---
+        cls = self.symtab._resolve_class(obj_type_name)
+        if cls and field_name in cls.methods:
+            # devolvemos referencia simbólica al método (no field)
+            return self.b.gen_expr_var(f"{obj_type_name}.{field_name}")
+
+        # Si no es método, tratamos como campo normal
         off = self.symtab.field_offset(obj_type_name, field_name)
-        # lectura (expr)
         return self.b.gen_field_load(obj_expr.value, off)
+
 
     def visitIndexExpr(self, ctx):
         # a[i] como parte de LHS
@@ -135,25 +170,58 @@ class TACGen(CompiscriptVisitor):
         return self.b.gen_expr_literal(0)
 
     def visitCallExpr(self, ctx):
-        # foo(args) y obj.m(args) (para este esqueleto: foo(args))
+        """
+        Traduce:
+        - foo(args)
+        - obj.metodo(args)
+        """
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 args.append(self.visit(e))
-        lhs_ctx = ctx.parentCtx
-        base_name = lhs_ctx.primaryAtom().Identifier().getText() if lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier() else None
-        if base_name:
-            return self.b.gen_call(base_name, args)
+
+        # Determinar si es llamada a método (obj.metodo)
+        lhs = ctx.parentCtx.primaryAtom()
+        if lhs and lhs.Identifier():
+            fname = lhs.Identifier().getText()
+
+            # Caso método: p.saludar()
+            if "." in fname:
+                obj_name, method_name = fname.split(".", 1)
+                obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+                if isinstance(obj_sym, VarSymbol):
+                    obj_type = obj_sym.type.name
+                    # Pasar this + args
+                    self.b.tac.emit("param", Var(obj_name))
+                    for a in args:
+                        self.b.tac.emit("param", a.value)
+                    tret = self.b.tmps.new()
+                    self.b.tac.emit("call", Const(f"{obj_type}.{method_name}"), Const(len(args)+1), tret)
+                    return ExprResult(tret, is_temp=True)
+
+            # Caso función normal
+            tret = self.b.gen_call(fname, args)
+            return tret
+
         return self.b.gen_expr_literal(0)
 
+ 
     # ---------- Statements ----------
     def visitVariableDeclaration(self, ctx):
-        # solo inicialización (para TAC)
         if ctx.initializer():
             rhs = self.visit(ctx.initializer().expression())
             name = ctx.Identifier().getText()
+            if rhs is None:
+                print(f"⚠️  [TACGen] Expresión None en inicialización de '{name}'")
+                rhs = ExprResult(Const(0), is_temp=False)
             self.b._assign(Var(name), rhs)
+
+            # --- DEBUG opcional ---
+            if name.startswith("p") and isinstance(rhs.value, Var):
+                print(f"✅ Objeto {name} inicializado como {rhs.value}")
+
         return None
+
 
     def visitConstantDeclaration(self, ctx):
         # idem variable, pero constante

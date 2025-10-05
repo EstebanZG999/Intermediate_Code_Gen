@@ -1,12 +1,13 @@
 import sys
 from antlr4 import *
-from CompiscriptLexer import CompiscriptLexer
-from CompiscriptParser import CompiscriptParser
+from program.CompiscriptLexer import CompiscriptLexer
+from program.CompiscriptParser import CompiscriptParser
 from program.semantic.type_checker import TypeChecker
 from program.semantic.error_reporter import ErrorReporter
 from program.semantic.table import print_symbol_table
 from program.ir.tac_builder import TACBuilder
 from program.ir.tac_gen import TACGen
+
 
 def compile_full_from_text(src: str):
     """
@@ -84,7 +85,12 @@ def main(argv):
     if not reporter.has_errors():
         print("\n=== Generación de Código Intermedio (TAC) ===")
         builder = TACBuilder()
-        gen = TACGen(checker.scopes, builder)
+
+        from program.semantic.table import SymbolTable
+        symtab = SymbolTable(checker.scopes)
+        gen = TACGen(symtab, builder)
+
+
         gen.visit(tree)
         print(builder.tac)
 
