@@ -444,30 +444,35 @@ class TypeChecker(CompiscriptVisitor):
         return VOID
 
     def visitCallExpr(self, ctx: CompiscriptParser.CallExprContext):
-        # Recolectar tipos de argumentos
+        # === 1. Recolectar tipos de argumentos ===
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 arg_t = self.visit(e) or VOID
                 args.append(arg_t)
 
-        # Verificar contexto (la llamada siempre cuelga de LeftHandSide)
+        # === 2. Subir al LHS (LeftHandSideContext) ===
         lhs_ctx = ctx.parentCtx
         if not isinstance(lhs_ctx, CompiscriptParser.LeftHandSideContext):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL", "Contexto inválido en llamada")
             return VOID
 
-        # Nombre base (para llamadas del estilo: foo(...))
+        # === 3. Obtener base_name de forma segura ===
         base_name = None
-        if lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
-            base_name = lhs_ctx.primaryAtom().Identifier().getText()
+        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom():
+            atom = lhs_ctx.primaryAtom()
+            if hasattr(atom, "Identifier") and atom.Identifier():
+                base_name = atom.Identifier().getText()
+            elif hasattr(atom, "ThisExpr") or atom.getText() == "this":
+                base_name = "this"
+            else:
+                base_name = None
 
-        # llamada simple:  Identifier '(' args ')'    (no hay más suffixes)
+        # === 4. Caso: llamada simple (foo(args)) ===
         if len(lhs_ctx.suffixOp()) == 1 and lhs_ctx.suffixOp(0) == ctx and base_name is not None:
-            # --- Búsqueda extendida: soporta funciones anidadas ---
             sym = self.resolve_symbol(base_name, ctx.start.line, ctx.start.column)
 
-            # Si no se encontró con resolve_symbol, busca manualmente en la cadena de scopes
+            # Buscar también en scopes anidados
             if not sym:
                 for scope in reversed(self.scopes.stack):
                     table = getattr(scope, "symbols", None)
@@ -475,20 +480,12 @@ class TypeChecker(CompiscriptVisitor):
                         sym = table[base_name]
                         break
 
-            # Validar que sea realmente una función
             if not sym or not isinstance(sym, FuncSymbol):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                    f"{base_name} no es una función válida o visible en este contexto")
+                                    f"{base_name} no es una función válida o visible")
                 return VOID
 
-
-            # Si la función captura un scope
-            pushed = False
-            if sym.closure_scope and sym.closure_scope is not self.scopes.current:
-                self.scopes.push_child(sym.closure_scope)
-                pushed = True
-
-            # Chequeo de aridad y tipos
+            # Validar tipos de argumentos
             if len(args) != len(sym.params):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
                                     f"Número incorrecto de argumentos en {base_name}")
@@ -496,66 +493,69 @@ class TypeChecker(CompiscriptVisitor):
                 for i, (arg_t, param) in enumerate(zip(args, sym.params)):
                     if not can_assign(param.type, arg_t):
                         self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                            f"Argumento {i} incompatible: {arg_t}, se esperaba {param.type}")
-
-            # Desapilar solo si apilamos antes
-            if pushed:
-                self.scopes.pop()
+                                            f"Argumento {i} incompatible en {base_name}: {arg_t}, se esperaba {param.type}")
 
             return sym.type.ret if isinstance(sym.type, FunctionType) else sym.type
 
-        # llamada con acceso previo:  obj . method '(' args ')'  (último suffix es la llamada)
+        # === 5. Caso: llamada de método (obj.metodo(args)) ===
         if len(lhs_ctx.suffixOp()) >= 2 and lhs_ctx.suffixOp()[-1] == ctx:
             prev_suffix = lhs_ctx.suffixOp()[-2]
             if isinstance(prev_suffix, CompiscriptParser.PropertyAccessExprContext):
                 method_name = prev_suffix.Identifier().getText()
-                obj_name = lhs_ctx.primaryAtom().getText()
-                obj_sym = self.resolve_symbol(obj_name, ctx.start.line, ctx.start.column)
+                obj_atom = lhs_ctx.primaryAtom()
 
-                if not obj_sym or not isinstance(obj_sym.type, Type):
+                # --- soporte para this.metodo() ---
+                if obj_atom.getText() == "this":
+                    obj_type = Type(self._current_class) if self._current_class else VOID
+                else:
+                    obj_sym = self.resolve_symbol(obj_atom.getText(), ctx.start.line, ctx.start.column)
+                    obj_type = obj_sym.type if obj_sym else VOID
+
+                if obj_type == VOID:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"{obj_name} no es un objeto válido")
+                                        f"Objeto inválido en llamada a {method_name}")
                     return VOID
 
-                class_sym = self.resolve_symbol(obj_sym.type.name, ctx.start.line, ctx.start.column)
+                class_sym = self.resolve_symbol(obj_type.name, ctx.start.line, ctx.start.column)
                 if not isinstance(class_sym, ClassSymbol):
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"{obj_sym.type.name} no es una clase válida")
+                                        f"{obj_type.name} no es una clase válida")
                     return VOID
 
-                # Buscar método en la jerarquía (herencia)
-                method = None
+                # Buscar método (recursivo por herencia)
                 cur_class = class_sym
+                method = None
                 while isinstance(cur_class, ClassSymbol):
-                    method = cur_class.methods.get(method_name)
-                    if method:
+                    if method_name in cur_class.methods:
+                        method = cur_class.methods[method_name]
                         break
                     if hasattr(cur_class, "base") and cur_class.base:
                         cur_class = self.resolve_symbol(cur_class.base, ctx.start.line, ctx.start.column)
                     else:
-                        cur_class = None
+                        break
 
                 if not method:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"Método {method_name} no definido en {obj_sym.type.name}")
+                                        f"Método {method_name} no definido en {obj_type.name}")
                     return VOID
 
-                # Chequeo de aridad y tipos
+                # Validar aridad y tipos
                 if len(args) != len(method.params):
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"Número incorrecto de argumentos en {obj_sym.type.name}.{method_name}")
+                                        f"Número incorrecto de argumentos en {obj_type.name}.{method_name}")
                 else:
                     for i, (arg_t, param) in enumerate(zip(args, method.params)):
                         if not can_assign(param.type, arg_t):
                             self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                                f"Argumento {i} incompatible en {obj_sym.type.name}.{method_name}: {arg_t} esperado {param.type}")
+                                                f"Argumento {i} incompatible en {obj_type.name}.{method_name}: {arg_t} esperado {param.type}")
 
                 return method.type.ret if isinstance(method.type, FunctionType) else method.type
 
-        # Si ninguna forma reconocida matcheó
+        # === 6. Fallback ===
         self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
                             f"Llamada inválida{f' en {base_name}' if base_name else ''}")
         return VOID
+
 
 
     def visitIdentifierExpr(self, ctx: CompiscriptParser.IdentifierExprContext):
@@ -925,28 +925,66 @@ class TypeChecker(CompiscriptVisitor):
         else:
             return self.visit(ctx.primaryExpr()) or VOID
 
+
     def visitPropertyAccessExpr(self, ctx: CompiscriptParser.PropertyAccessExprContext):
+        """
+        Traduce expresiones del tipo:
+            obj.prop
+            this.prop
+        y retorna el tipo del campo o método correspondiente.
+        """
         lhs_ctx = ctx.parentCtx
         obj_t = VOID
+
+        # === 1. Determinar el tipo del objeto base ===
         if isinstance(lhs_ctx, CompiscriptParser.LeftHandSideContext):
             if lhs_ctx.primaryAtom():
-                obj_t = self.visit(lhs_ctx.primaryAtom()) or VOID
+                atom = lhs_ctx.primaryAtom()
+                txt = atom.getText()
+
+                # Caso especial: this.prop
+                if txt == "this":
+                    if not self._current_class:
+                        self.reporter.report(ctx.start.line, ctx.start.column, "E_THIS",
+                                            "Uso de 'this' fuera de una clase")
+                        return VOID
+                    obj_t = Type(self._current_class)
+                elif hasattr(atom, "Identifier") and atom.Identifier():
+                    base_name = atom.Identifier().getText()
+                    sym = self.resolve_symbol(base_name, ctx.start.line, ctx.start.column)
+                    obj_t = sym.type if isinstance(sym, VarSymbol) else VOID
+                else:
+                    obj_t = VOID
 
         prop_name = ctx.Identifier().getText()
 
+        # === 2. Si el objeto es de tipo clase, buscar campo o método ===
         if isinstance(obj_t, Type):
             class_sym = self.resolve_symbol(obj_t.name, ctx.start.line, ctx.start.column)
-            while isinstance(class_sym, ClassSymbol):   
+            while isinstance(class_sym, ClassSymbol):
+                # Buscar en campos
                 if prop_name in class_sym.fields:
                     return class_sym.fields[prop_name].type
+                # Buscar en métodos
                 if prop_name in class_sym.methods:
                     return class_sym.methods[prop_name].type
+                # Buscar en la clase base
                 if hasattr(class_sym, "base") and class_sym.base:
                     class_sym = self.resolve_symbol(class_sym.base, ctx.start.line, ctx.start.column)
                 else:
                     break
+
+            # Si no se encontró el campo ni método
+            self.reporter.report(ctx.start.line, ctx.start.column, "E_PROP",
+                                f"Propiedad o método '{prop_name}' no definido en {obj_t.name}")
+            return VOID
+
+        # === 3. Si no es clase, error ===
+        self.reporter.report(ctx.start.line, ctx.start.column, "E_PROP",
+                            f"No se puede acceder a la propiedad '{prop_name}' de {obj_t}")
         return VOID
 
+ 
     def visitLeftHandSide(self, ctx: CompiscriptParser.LeftHandSideContext):
         t = self.visit(ctx.primaryAtom()) or VOID
         for suffix in ctx.suffixOp():
