@@ -1,7 +1,7 @@
 from program.CompiscriptVisitor import CompiscriptVisitor
 from program.CompiscriptParser import CompiscriptParser
 from program.ir.tac_builder import TACBuilder, ExprResult
-from program.ir.tac_ir import Var, Const
+from program.ir.tac_ir import Var, Const, Addr  
 from program.semantic.symbols import VarSymbol, FuncSymbol, ClassSymbol
 from program.semantic.table import SymbolTable
 
@@ -18,8 +18,47 @@ class TACGen(CompiscriptVisitor):
             self.visit(st)
         return None
 
+    # === helper: valor de una variable (lee del frame si aplica)
+    def _current_fn_sym(self):
+        """Devuelve el FuncSymbol de la función/metodo actual usando self.fn_stack."""
+        if not self.fn_stack:
+            return None
+        q = self.fn_stack[-1]
+        root = self.symtab.scope_stack.stack[0]  # scope global
+
+        if "." in q:  # Clase.metodo
+            cls_name, mname = q.split(".", 1)
+            cls_sym = root.resolve(cls_name)
+            if isinstance(cls_sym, ClassSymbol):
+                return cls_sym.methods.get(mname)
+            return None
+        # función toplevel
+        sym = root.resolve(q)
+        return sym if isinstance(sym, FuncSymbol) else None
+
+    def _addr_of_name(self, name: str):
+        """Devuelve Addr(fp, offset) si 'name' vive en el AR de la función actual, si no None."""
+        fn = self._current_fn_sym()
+        if fn and fn.activation_record:
+            slot = fn.activation_record.addr_of(name)  # tu AR devuelve algo con 'offset'
+            if slot:
+                return Addr("fp", int(slot.offset))
+        return None
+
+    def _value_of_name(self, name: str) -> ExprResult:
+        """Lee una variable: si está en el frame (param/local/this) => load &(fp+off); si no, Var(name)."""
+        addr = self._addr_of_name(name)
+        if addr:
+            return self.b.gen_load_addr(addr)
+        # global/const u otros símbolos
+        return ExprResult(Var(name), is_temp=False)
+
     # ---------- Literales / Identificadores ----------
     def visitLiteralExpr(self, ctx: CompiscriptParser.LiteralExprContext):
+        # *** NUEVO: manejar arrays ***
+        if hasattr(ctx, "arrayLiteral") and ctx.arrayLiteral():
+            return self.visit(ctx.arrayLiteral())
+
         txt = ctx.getText()
         if txt == "null":
             return self.b.gen_expr_literal(None)
@@ -28,13 +67,12 @@ class TACGen(CompiscriptVisitor):
         if txt.isdigit():
             return self.b.gen_expr_literal(int(txt))
         if txt.startswith('"') and txt.endswith('"'):
-            # si tu IR trata strings como Const(str)
             return ExprResult(Const(txt.strip('"')))
         return self.b.gen_expr_literal(0)
 
     def visitIdentifierExpr(self, ctx: CompiscriptParser.IdentifierExprContext):
         name = ctx.Identifier().getText()
-        return self.b.gen_expr_var(name)
+        return self._value_of_name(name)
 
     # ---------- Operadores (usa tu builder ya hecho) ----------
     def visitAdditiveExpr(self, ctx):
@@ -159,36 +197,35 @@ class TACGen(CompiscriptVisitor):
         field_name = ctx.Identifier().getText()
         lhs_text = lhs_ctx.getText()
 
-        # --- Caso 1: this.campo ---
-        if lhs_text.startswith("this."):
-            cls_name = self.fn_stack[0].split('.')[0] if self.fn_stack else None
+        # this.campo
+        if lhs_text == "this":
+            # base = valor de this (puntero)
+            base = self._value_of_name("this").value
+            # clase actual (si fn_stack = ["Persona.saludar"] → "Persona")
+            cls_name = None
+            if self.fn_stack and "." in self.fn_stack[0]:
+                cls_name = self.fn_stack[0].split(".", 1)[0]
             off = self.symtab.field_offset(cls_name, field_name) if cls_name else 0
-            return self.b.gen_field_load(Var("this"), off)
+            return self.b.gen_field_load(base, off)
 
-        # --- Caso 2: obj.campo ---
-        # Intentamos visitar la base del objeto
+        # obj.campo
         obj_expr = self.visit(lhs_ctx.primaryAtom())
+        base_op = obj_expr.value
+        if isinstance(base_op, Var):
+            base_op = self._value_of_name(base_op.name).value
 
-        # Si el objeto es variable, obtener su tipo desde la tabla de símbolos
+        # tipo del objeto si es símbolo
+        obj_type_name = None
         if isinstance(obj_expr.value, Var):
             var_sym = self.symtab.scope_stack.current.resolve(obj_expr.value.name)
             obj_type_name = var_sym.type.name if isinstance(var_sym, VarSymbol) else None
-        else:
-            obj_type_name = None
 
-        # Si no se conoce tipo, devolvemos literal 0
-        if obj_type_name is None:
-            return self.b.gen_expr_literal(0)
-
-        # Si el campo es un método declarado en la clase
-        cls = self.symtab._resolve_class(obj_type_name)
+        cls = self.symtab._resolve_class(obj_type_name) if obj_type_name else None
         if cls and field_name in cls.methods:
-            # devolver referencia simbólica al método
             return self.b.gen_expr_var(f"{obj_type_name}.{field_name}")
 
-        # Caso general: campo normal
-        off = self.symtab.field_offset(obj_type_name, field_name)
-        return self.b.gen_field_load(obj_expr.value, off)
+        off = self.symtab.field_offset(obj_type_name, field_name) if obj_type_name else 0
+        return self.b.gen_field_load(base_op, off)
 
 
     def visitIndexExpr(self, ctx):
@@ -197,9 +234,10 @@ class TACGen(CompiscriptVisitor):
         base_name = lhs_ctx.Identifier().getText() if lhs_ctx and lhs_ctx.Identifier() else None
         idx_res = self.visit(ctx.expression())
         if base_name:
-            return self.b.gen_expr_index(base_name, idx_res)
+            base_val = self._value_of_name(base_name).value  # carga arr si es param/local
+            return self.b.gen_array_load(base_val, idx_res)
         return self.b.gen_expr_literal(0)
-
+    
     def visitCallExpr(self, ctx):
         """
         Genera TAC para llamadas a funciones o métodos.
@@ -214,66 +252,51 @@ class TACGen(CompiscriptVisitor):
             for e in ctx.arguments().expression():
                 args.append(self.visit(e))
 
-        # Determinar el contexto padre
         parent = ctx.parentCtx
         lhs = getattr(parent, "parentCtx", None)
         lhs_text = lhs.getText() if lhs else ctx.getText()
 
-        # --- Caso 1: llamada tipo this.metodo() ---
+        # this.metodo(...)
         if lhs_text.startswith("this."):
             _, method_name = lhs_text.split(".", 1)
-            self.b.tac.emit("param", Var("this"))
-            for a in args:
-                self.b.tac.emit("param", a.value)
+            self.b.tac.emit("param", self._value_of_name("this").value)  # carga this
+            for a in args: self.b.tac.emit("param", a.value)
             tmp = self.b.tmps.new()
-            # calificar con la clase actual si se conoce (por fn_stack)
-            cls_name = self.fn_stack[0].split('.')[0] if self.fn_stack else "global"
-            callee = f"{cls_name}.{method_name}"
-            self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
+            cls_name = self.fn_stack[0].split('.', 1)[0] if self.fn_stack else "global"
+            self.b.tac.emit("call", Const(f"{cls_name}.{method_name}"), Const(len(args)+1), tmp)
             return ExprResult(tmp, is_temp=True)
 
-        # --- Caso 2: llamada tipo obj.metodo() ---
+        # obj.metodo(...)
         if "." in lhs_text and not lhs_text.startswith("this."):
             before_paren = lhs_text.split("(", 1)[0]
             obj_name, method_name = before_paren.split(".", 1)
+            obj_val = self._value_of_name(obj_name).value  # CARGA obj del frame si aplica
+            self.b.tac.emit("param", obj_val)
+            for a in args: self.b.tac.emit("param", a.value)
 
-            # Resuelve tipo del objeto (si es símbolo conocido)
-            obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+            # intentar resolver el tipo desde el global (si no, usar el nombre)
+            root = self.symtab.scope_stack.stack[0]
+            obj_sym = root.resolve(obj_name)
             obj_type = obj_sym.type.name if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name") else None
-
-            # Pasa this (obj) y los demás argumentos
-            self.b.tac.emit("param", Var(obj_name))
-            for a in args:
-                self.b.tac.emit("param", a.value)
 
             tmp = self.b.tmps.new()
             callee = f"{obj_type}.{method_name}" if obj_type else f"{obj_name}.{method_name}"
-            self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
+            self.b.tac.emit("call", Const(callee), Const(len(args)+1), tmp)
             return ExprResult(tmp, is_temp=True)
 
-        # --- Caso 3: llamada tipo f(args) (función global o anidada) ---
-        base_name = None
+        # f(args)
         if hasattr(ctx.parentCtx, "primaryAtom") and ctx.parentCtx.primaryAtom() and ctx.parentCtx.primaryAtom().Identifier():
             base_name = ctx.parentCtx.primaryAtom().Identifier().getText()
         else:
-            # Fallback textual
             base_name = ctx.getText().split("(", 1)[0]
 
-        # Calificar si estamos dentro de función anidada
         callee_name = f"{self.fn_stack[-1]}.{base_name}" if self.fn_stack else base_name
-
-        # Emitir params y llamada
         for a in args:
             self.b.tac.emit("param", a.value)
         tmp = self.b.tmps.new()
         self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
         return ExprResult(tmp, is_temp=True)
 
-
-
-
- 
- 
     # ---------- Statements ----------
     def visitVariableDeclaration(self, ctx):
         """
@@ -282,56 +305,67 @@ class TACGen(CompiscriptVisitor):
         var arr = [1,2,3];
         """
         name = ctx.Identifier().getText()
-        if ctx.initializer():
-            init = ctx.initializer()
 
-            # Verificamos si el initializer contiene un array literal
-            expr = init.expression()
-            if expr and expr.getChildCount() > 0:
-                # Buscar si el primer hijo es un arrayLiteral
-                first_child = expr.getChild(0)
-                if isinstance(first_child, CompiscriptParser.ArrayLiteralContext):
-                    rhs = self.visit(first_child)
-                else:
-                    rhs = self.visit(expr)
-            else:
-                rhs = self.b.gen_expr_literal(0)
+        if ctx.initializer():
+            rhs = self.visit(ctx.initializer().expression())
         else:
             rhs = self.b.gen_expr_literal(0)
 
-        self.b._assign(Var(name), rhs)
+        addr = self._addr_of_name(name)
+        if addr:
+            self.b.gen_store_addr(addr, rhs)   # local/param/this
+        else:
+            self.b._assign(Var(name), rhs)     # global
+
         return None
-
-
-
+    
     def visitConstantDeclaration(self, ctx):
-        # idem variable, pero constante
         rhs = self.visit(ctx.expression())
         name = ctx.Identifier().getText()
-        self.b._assign(Var(name), rhs)
+
+        addr = self._addr_of_name(name)
+        if addr:
+            self.b.gen_store_addr(addr, rhs)
+        else:
+            self.b._assign(Var(name), rhs)
         return None
 
     def visitAssignment(self, ctx):
         exprs = ctx.expression()
         if isinstance(exprs, list) and len(exprs) == 2:
-            # obj.prop = expr
-            obj = self.visit(exprs[0])  # ExprResult
+            # obj.prop = expr  (tu código actual está bien, pero usa _value_of_name para la base)
+            obj = self.visit(exprs[0])
             prop = ctx.Identifier().getText()
             val = self.visit(exprs[1])
-            # deduce tipo de obj
+
+            base_op = obj.value
+            if isinstance(base_op, Var):
+                # cargar this/locals/params si aplica
+                base_addr = self._addr_of_name(base_op.name)
+                base_op = self.b.gen_load_addr(base_addr).value if base_addr else base_op
+
+            # tipo del objeto (solo intentamos con el global para no depender del scope dinámico)
             obj_type_name = None
             if isinstance(obj.value, Var):
-                var_sym = self.symtab.scope_stack.current.resolve(obj.value.name)
+                root = self.symtab.scope_stack.stack[0]
+                var_sym = root.resolve(obj.value.name)
                 obj_type_name = var_sym.type.name if isinstance(var_sym, VarSymbol) else None
+
             off = self.symtab.field_offset(obj_type_name, prop) if obj_type_name else 0
-            self.b.gen_field_store(obj.value, off, val)
+            self.b.gen_field_store(base_op, off, val)
             return None
-        # var = expr
+
+        # var simple = expr
         name = ctx.Identifier().getText()
         val = self.visit(exprs[0] if isinstance(exprs, list) else exprs)
-        self.b._assign(Var(name), val)
-        return None
 
+        addr = self._addr_of_name(name)
+        if addr:
+            self.b.gen_store_addr(addr, val)
+        else:
+            self.b._assign(Var(name), val)
+        return None
+    
     def visitPrintStatement(self, ctx):
         v = self.visit(ctx.expression())
         self.b.gen_stmt_print(v)
@@ -399,10 +433,27 @@ class TACGen(CompiscriptVisitor):
         self.b.gen_fn_end(fname)
         return None
 
-
-
     def visitClassDeclaration(self, ctx):
-        # TAC no materializa clases por ahora (solo accedemos a offsets vía symtab)
+        class_name = ctx.Identifier(0).getText()
+
+        for member in ctx.classMember():
+            fdecl = member.functionDeclaration()
+            if not fdecl:
+                continue
+            mname = fdecl.Identifier().getText()
+            qname = f"{class_name}.{mname}"
+
+            # begin
+            self.b.gen_fn_begin(qname)
+            self.fn_stack.append(qname)
+            try:
+                for st in fdecl.block().statement():
+                    self.visit(st)
+            finally:
+                self.fn_stack.pop()
+            # end
+            self.b.gen_fn_end(qname)
+
         return None
 
     def visitDoWhileStatement(self, ctx):
@@ -453,9 +504,6 @@ class TACGen(CompiscriptVisitor):
 
         self.b.gen_stmt_for(init_cb, cond_cb, step_cb, body_cb)
         return None
-
-
-
  
     def visitBreakStatement(self, ctx):
         self.b.gen_stmt_break()
@@ -499,7 +547,7 @@ class TACGen(CompiscriptVisitor):
 
     def visitThisExpr(self, ctx):
         # 'this' sin campo explícito
-        return self.b.gen_expr_var("this")
+        return self._value_of_name("this")
 
 
 
@@ -539,34 +587,28 @@ class TACGen(CompiscriptVisitor):
     # | conditionalExpr                                # ExprNoAssign
 
     def visitAssignExpr(self, ctx: CompiscriptParser.AssignExprContext):
-        # LHS puede ser Identificador o índice (a[i] = ...)
         lhs_ctx = ctx.lhs
         rhs = self.visit(ctx.assignmentExpr())
 
-        # Caso: a[i] = v  (si el último sufijo es IndexExpr)
-        # Inspeccionamos el texto por simplicidad (podrías caminar el AST si prefieres)
         lhs_text = lhs_ctx.getText()
         if '[' in lhs_text and lhs_text.endswith(']'):
-            # extraer base e índice: a[i]
             base = lhs_text[:lhs_text.index('[')]
-            # mejor visitar el índice real del último suffix:
-            # asumimos una sola indexación al final:
-            # buscamos el ÚLTIMO suffix, que es IndexExpr
             suffixes = list(lhs_ctx.suffixOp())
             if suffixes and suffixes[-1].expression():
                 idx = self.visit(suffixes[-1].expression())
                 self.b.gen_stmt_assign_index(base, idx, rhs)
                 return rhs
 
-        # Caso general: variable simple
         if lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
             var_name = lhs_ctx.primaryAtom().Identifier().getText()
-            self.b._assign(Var(var_name), rhs)
+            addr = self._addr_of_name(var_name)
+            if addr:
+                self.b.gen_store_addr(addr, rhs)   # usa frame
+            else:
+                self.b._assign(Var(var_name), rhs) # global
             return rhs
 
-        # Fallback (si apareciera otra forma)
         return rhs
-
 
     def visitPropertyAssignExpr(self, ctx: CompiscriptParser.PropertyAssignExprContext):
         # obj.prop = expr
