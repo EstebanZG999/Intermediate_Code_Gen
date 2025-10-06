@@ -912,8 +912,15 @@ class TypeChecker(CompiscriptVisitor):
         self.scopes.pop()
         return None
 
-
     def visitIndexExpr(self, ctx: CompiscriptParser.IndexExprContext):
+        """
+        Maneja expresiones de indexación de arreglos, como:
+            a[0], m[1][2], etc.
+
+        Valida que el índice sea integer y que el objeto sea un arreglo.
+        Soporta arreglos multidimensionales (integer[][] -> integer[] -> integer).
+        """
+        # === 1. Resolver el nombre base del arreglo ===
         lhs_ctx = ctx.parentCtx.primaryAtom()
         if lhs_ctx and lhs_ctx.Identifier():
             arr_name = lhs_ctx.Identifier().getText()
@@ -922,18 +929,33 @@ class TypeChecker(CompiscriptVisitor):
         else:
             arr_t = VOID
 
+        # === 2. Verificar el tipo del índice ===
         idx_t = self.visit(ctx.expression()) or VOID
         if idx_t != INTEGER:
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"Índice debe ser integer, no {idx_t}")
 
+        # === 3. Validar que el objeto sea un arreglo ===
         if not is_array(arr_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"El objeto {arr_t} no es indexable")
             return VOID
 
+        # === 4. Si es un arreglo multidimensional, reducir una dimensión ===
+        if isinstance(arr_t, ArrayType):
+            # integer[][] → integer[]
+            if arr_t.dims > 1:
+                return make_array(arr_t.elem, arr_t.dims - 1)
+            # integer[] → integer
+            else:
+                return arr_t.elem
+
+        # === 5. Caso general (por compatibilidad con tipos antiguos) ===
         elem_t = element_type(arr_t) or VOID
         return elem_t
+
+
+
 
     def visitUnaryExpr(self, ctx: CompiscriptParser.UnaryExprContext):
         if ctx.getChildCount() == 2:  
