@@ -4,6 +4,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 import streamlit as st
 from antlr4 import InputStream, CommonTokenStream
 from antlr4.tree.Trees import Trees
+import pandas as pd
 
 from program.CompiscriptLexer import CompiscriptLexer
 from program.CompiscriptParser import CompiscriptParser
@@ -69,7 +70,8 @@ def compile_code(source: str):
     checker = TypeChecker(reporter)
     checker.visit(tree)
 
-    return reporter, checker.scopes, parser, tree
+    return reporter, checker.scopes, checker.symtab, parser, tree
+
 
 def render_scope(scope, container, indent=0):
     pad = " " * (indent * 2)
@@ -173,6 +175,13 @@ def render_symbols(scopes, st):
     else:
         st.info("No hay funciones globales.")
 
+def _fmt_addr(sym):
+    off = getattr(sym, "offset", None)
+    reg = getattr(sym, "region", None)
+    if off is None or reg not in ("param","local","this"):
+        return ""
+    sign = "+" if int(off) >= 0 else ""
+    return f"[fp{sign}{int(off)}]"
 
 
 st.set_page_config(page_title="Compiscript IDE", layout="wide")
@@ -208,7 +217,7 @@ with col_c:
     max_nodes = st.slider("Límite de nodos del árbol", min_value=200, max_value=5000, value=2000, step=100)
 
 if do_compile:
-    reporter, scopes, parser, tree = compile_code(code)
+    reporter, scopes, symtab, parser, tree = compile_code(code)
 
     if reporter.has_errors():
         st.error(" Errores semánticos encontrados:")
@@ -226,27 +235,85 @@ if do_compile:
     if show_tac and not reporter.has_errors():
         st.subheader("TAC")
         # Usamos la tabla de símbolos a partir de 'scopes'
-        symtab  = SymbolTable(scopes)
         builder = TACBuilder()
         gen     = TACGen(symtab, builder)
         gen.visit(tree)
-        tac_text = "\n".join(str(instr) for instr in builder.tac.code)
-        st.code(tac_text, language="text")
+        st.code(builder.tac.dump(), language="text")
 
     # Tabla de símbolos por scope
     for scope in scopes.stack:
         st.subheader(f"Scope: {scope.kind}")
-        rows = [
-            {
+
+        rows = []
+        for _, sym in scope.items():
+            row = {
                 "Category": sym.category,
                 "Name": sym.name,
                 "Type": str(sym.type),
-                "Line": sym.line,
-                "Col": sym.col
+                "Region": getattr(sym, "region", None),
+                "Addr": _fmt_addr(sym),   
+                "Offset": getattr(sym, "offset", None),
+                "Line": getattr(sym, "line", 0),
+                "Col": getattr(sym, "col", 0),
             }
-            for _, sym in scope.items()
-        ]
-        st.table(rows)
+            rows.append(row)
+
+            # Parámetros si es función
+            if isinstance(sym, FuncSymbol):
+                for p in sym.params:
+                    rows.append({
+                        "Category": "param",
+                        "Name": p.name,
+                        "Type": str(p.type),
+                        "Region": "param" if getattr(p, "offset", None) is not None else None,
+                        "Offset": getattr(p, "offset", None),
+                        "Line": getattr(p, "line", 0),
+                        "Col": getattr(p, "col", 0),
+                    })
+
+                # Activation Record (si existe)
+                if getattr(sym, "activation_record", None):
+                    ar = sym.activation_record
+                    with st.expander(f"AR de {sym.name}"):
+                        st.write(
+                            f"**has_this**={ar.has_this}, "
+                            f"**params_size**={ar.params_size}, "
+                            f"**locals_size**={ar.locals_size}, "
+                            f"**frame_size**={ar.frame_size}"
+                        )
+
+            # Si es clase, listar campos y métodos (y AR de métodos si lo hay)
+            if isinstance(sym, ClassSymbol):
+                if getattr(sym, "fields", None):
+                    st.markdown(f"**Campos de `{sym.name}`**")
+                    st.table([{
+                        "Name": fname,
+                        "Type": str(fsym.type),
+                        "field_offset": getattr(fsym, "field_offset", None),
+                    } for fname, fsym in sym.fields.items()])
+
+                if getattr(sym, "methods", None):
+                    st.markdown(f"**Métodos de `{sym.name}`**")
+                    st.table([{
+                        "Name": mname,
+                        "Type": str(msym.type),
+                        "Params": ", ".join(f"{p.name}: {p.type}" for p in msym.params),
+                    } for mname, msym in sym.methods.items()])
+
+                    # AR por método
+                    for mname, msym in sym.methods.items():
+                        if getattr(msym, "activation_record", None):
+                            ar = msym.activation_record
+                            with st.expander(f"AR de {sym.name}.{mname}"):
+                                st.write(
+                                    f"**has_this**={ar.has_this}, "
+                                    f"**params_size**={ar.params_size}, "
+                                    f"**locals_size**={ar.locals_size}, "
+                                    f"**frame_size**={ar.frame_size}"
+                                )
+
+        if rows:
+            st.table(rows)
 
     # mostrar parámetros de cada función declarada en el scope global
     # ---- Mostrar clases y sus miembros (en el global)
