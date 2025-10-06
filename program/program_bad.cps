@@ -1,29 +1,75 @@
-// Constante mal inicializada: integer ← string
-const PI: integer = "no soy un número";
+// =========================
+//  Pruebas de Acciones Semánticas TAC
+// =========================
 
-// Variable sin tipo explícito, pero asignación incorrecta
-let saludo = 123;   // debería ser string si luego lo usamos como tal
+// --- Variables y constantes ---
+let x = 5;
+var y = 10;
+const z = 3;
 
-// Variable usada sin declarar
-resultado = 10;  // no existe resultado todavía
+// --- Expresiones aritméticas ---
+x = x + y * z - (y / 2);
 
-// Función con return mal tipado
-function sumarTexto(a: integer, b: integer): integer {
-  return "hola";  // error: string a integer
+// --- Expresiones lógicas y ternario ---
+let cond = (x > 10) && (y < 20) || false;
+let t = cond ? 100 : 0;
+print(t);
+
+// --- Ciclo while ---
+while (x < 15) {
+  print(x);
+  x = x + 1;
 }
 
-// Clase con asignación de tipo incorrecto
+// --- Ciclo do-while ---
+do {
+  print(x);
+  x = x - 1;
+} while (x > 10);
+
+// --- Ciclo for ---
+for (let i = 0; i < 5; i = i + 1) {
+  if (i == 2) continue;
+  if (i == 4) break;
+  print(i);
+}
+
+// --- Arreglos y acceso ---
+let nums = [1, 2, 3, 4];
+nums[2] = 99;
+print(nums[2]);
+
+// --- Switch con default ---
+switch (x) {
+  case 8:
+    print("case 8");
+    break;
+  case 10:
+    print("case 10");
+    break;
+  default:
+    print("default");
+}
+
+// --- Función simple ---
+function suma(a, b) {
+  let r = a + b;
+  return r;
+}
+
+print(suma(3, 4));
+
+// --- Clase con campo y método ---
 class Persona {
-  let edad: integer;
-
-  function constructor(edad: integer) {
-    this.edad = "treinta"; // error: string a integer
-  }
-
-  function hablar(): string {
-    return 123; // error: integer a string
+  var nombre;
+  function saludar() {
+    print("Hola, soy " + this.nombre);
   }
 }
 
-// Instancia de clase no definida
-let x: Animal = new Animal(); // error: clase Animal no existe
+let p = new Persona();
+p.nombre = "Oscar";
+p.saludar();
+
+// --- Fin del programa ---
+print("Fin de pruebas TAC");

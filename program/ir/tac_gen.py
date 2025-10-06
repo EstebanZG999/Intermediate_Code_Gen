@@ -10,6 +10,7 @@ class TACGen(CompiscriptVisitor):
         super().__init__()
         self.symtab = symtab
         self.b = builder
+        self.fn_stack: list[str] = []
 
     # ---------- Programa ----------
     def visitProgram(self, ctx: CompiscriptParser.ProgramContext):
@@ -73,16 +74,29 @@ class TACGen(CompiscriptVisitor):
         return L
 
     def visitLogicalAndExpr(self, ctx):
-        def fold(i, acc):
-            if i == len(ctx.equalityExpr()): return acc
-            return self.b.gen_expr_and(acc, lambda: self.visit(ctx.equalityExpr(i)))
-        return fold(1, self.visit(ctx.equalityExpr(0)))
+        # Si solo hay una subexpresión, devuélvela directamente
+        if len(ctx.equalityExpr()) == 1:
+            return self.visit(ctx.equalityExpr(0))
+
+        # Caso con múltiples && encadenados
+        L = self.visit(ctx.equalityExpr(0))
+        for i in range(1, len(ctx.equalityExpr())):
+            R = self.visit(ctx.equalityExpr(i))
+            L = self.b.gen_expr_and(L, lambda R=R: R)
+        return L
 
     def visitLogicalOrExpr(self, ctx):
-        def fold(i, acc):
-            if i == len(ctx.logicalAndExpr()): return acc
-            return self.b.gen_expr_or(acc, lambda: self.visit(ctx.logicalAndExpr(i)))
-        return fold(1, self.visit(ctx.logicalAndExpr(0)))
+        # Si solo hay una subexpresión, devuélvela directamente
+        if len(ctx.logicalAndExpr()) == 1:
+            return self.visit(ctx.logicalAndExpr(0))
+
+        # Caso con múltiples || encadenados
+        L = self.visit(ctx.logicalAndExpr(0))
+        for i in range(1, len(ctx.logicalAndExpr())):
+            R = self.visit(ctx.logicalAndExpr(i))
+            L = self.b.gen_expr_or(L, lambda R=R: R)
+        return L
+
 
     def visitUnaryExpr(self, ctx):
         if ctx.getChildCount() == 2:
@@ -171,68 +185,89 @@ class TACGen(CompiscriptVisitor):
 
     def visitCallExpr(self, ctx):
         """
-        Traduce:
-        - foo(args)               → llamada normal
-        - obj.metodo(args)        → llamada a método con this
+        - foo(args)               → función global o local calificada si estamos dentro de otra función
+        - obj.metodo(args)        → método con this como primer argumento
         """
+        # 1) argumentos
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 args.append(self.visit(e))
 
-        # Determinar si es una llamada de la forma obj.metodo(args)
-        lhs_ctx = ctx.parentCtx
-        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom():
-            atom = lhs_ctx.primaryAtom()
+        # 2) subir al LHS (SuffixOp(Call) -> LeftHandSide)
+        parent = ctx.parentCtx
+        lhs = getattr(parent, "parentCtx", None)
+        if lhs is not None:
+            lhs_text = lhs.getText()
 
-            # Caso: obj.metodo(args)
-            if hasattr(atom, "leftHandSide") and atom.leftHandSide():
-                lhs = atom.leftHandSide()
-                if lhs.getChildCount() >= 3 and lhs.getChild(1).getText() == '.':
-                    obj_name = lhs.getChild(0).getText()
-                    method_name = lhs.getChild(2).getText()
+            # 2a) llamada a método obj.metodo(...)
+            if "." in lhs_text:
+                before_paren = lhs_text.split("(", 1)[0]
+                obj_name, method_name = before_paren.split(".", 1)
 
-                    # Resuelve tipo del objeto
-                    obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
-                    if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name"):
-                        obj_type = obj_sym.type.name
-                        # Emitir this (objeto) y los argumentos
-                        self.b.tac.emit("param", Var(obj_name))
-                        for a in args:
-                            self.b.tac.emit("param", a.value)
-                        tmp = self.b.tmps.new()
-                        self.b.tac.emit("call", Const(f"{obj_type}.{method_name}"), Const(len(args) + 1), tmp)
-                        return ExprResult(tmp, is_temp=True)
+                # intenta resolver el tipo del objeto
+                obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+                obj_type = obj_sym.type.name if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name") else None
 
-        # Caso: foo(args) — llamada normal a función global
-        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
-            func_name = lhs_ctx.primaryAtom().Identifier().getText()
-            for a in args:
-                self.b.tac.emit("param", a.value)
-            tmp = self.b.tmps.new()
-            self.b.tac.emit("call", Const(func_name), Const(len(args)), tmp)
-            return ExprResult(tmp, is_temp=True)
+                # this + args
+                self.b.tac.emit("param", Var(obj_name))
+                for a in args:
+                    self.b.tac.emit("param", a.value)
 
-        # Fallback
-        return self.b.gen_expr_literal(0)
+                tmp = self.b.tmps.new()
+                callee = f"{obj_type}.{method_name}" if obj_type else f"{obj_name}.{method_name}"
+                self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
+                return ExprResult(tmp, is_temp=True)
+
+            # 2b) función (foo(args))
+            if hasattr(lhs, "primaryAtom") and lhs.primaryAtom() and lhs.primaryAtom().Identifier():
+                base_name = lhs.primaryAtom().Identifier().getText()
+
+                # si estamos en función anidada, probar calificada: <outer>.<base_name>
+                qualified = f"{self.fn_stack[-1]}.{base_name}" if self.fn_stack else base_name
+
+                # emitimos como calificada si hay anidamiento; si quieres ser más estricto
+                # podrías chequear en symtab si existe; aquí preferimos calificar SOLO si hay anidamiento
+                callee_name = qualified if self.fn_stack else base_name
+
+                for a in args:
+                    self.b.tac.emit("param", a.value)
+                tmp = self.b.tmps.new()
+                self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
+                return ExprResult(tmp, is_temp=True)
+
+            # 3) Si el LHS no existe (llamada directa en expresión)
+            if ctx.Identifier():
+                func_name = ctx.Identifier().getText()
+                # calificar si estamos dentro de función anidada
+                callee_name = f"{self.fn_stack[-1]}.{func_name}" if self.fn_stack else func_name
+                for a in args:
+                    self.b.tac.emit("param", a.value)
+                tmp = self.b.tmps.new()
+                self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
+                return ExprResult(tmp, is_temp=True)
+
+            # 4) fallback final
+            return self.b.gen_expr_literal(0)
+
+
 
  
  
     # ---------- Statements ----------
     def visitVariableDeclaration(self, ctx):
+        name = ctx.Identifier().getText()
         if ctx.initializer():
-            rhs = self.visit(ctx.initializer().expression())
-            name = ctx.Identifier().getText()
+            init = ctx.initializer()
+            if init.arrayLiteral():
+                rhs = self.visit(init.arrayLiteral())
+            else:
+                rhs = self.visit(init.expression())
             if rhs is None:
-                print(f"⚠️  [TACGen] Expresión None en inicialización de '{name}'")
                 rhs = ExprResult(Const(0), is_temp=False)
             self.b._assign(Var(name), rhs)
-
-            # --- DEBUG opcional ---
-            if name.startswith("p") and isinstance(rhs.value, Var):
-                print(f"✅ Objeto {name} inicializado como {rhs.value}")
-
         return None
+
 
 
     def visitConstantDeclaration(self, ctx):
@@ -278,18 +313,30 @@ class TACGen(CompiscriptVisitor):
     def visitIfStatement(self, ctx):
         cond = self.visit(ctx.expression())
         def then_cb(b): self.visit(ctx.block(0))
-        def else_cb(b): self.visit(ctx.block(1))
-        if ctx.block(1):
+        def else_cb(b): self.visit(ctx.block(1)) if len(ctx.block()) > 1 else None
+        if len(ctx.block()) > 1:
             self.b.gen_stmt_if(cond, then_cb, else_cb)
         else:
             self.b.gen_stmt_if(cond, then_cb, None)
         return None
 
+
     def visitWhileStatement(self, ctx):
-        def cond_cb(b): return self.visit(ctx.expression())
-        def body_cb(b): self.visit(ctx.block())
+        """
+        Traduce:
+        while (<expr>) <block>
+        """
+        def cond_cb(b):
+            if ctx.expression():
+                return self.visit(ctx.expression())
+            return self.b.gen_expr_literal(1)  # por si falta expresión
+
+        def body_cb(b):
+            self.visit(ctx.block())
+
         self.b.gen_stmt_while(cond_cb, body_cb)
         return None
+
 
     def visitBlock(self, ctx):
         for st in ctx.statement():
@@ -299,14 +346,210 @@ class TACGen(CompiscriptVisitor):
     # ---------- Funciones y clases (solo etiquetas para funciones top-level) ----------
     def visitFunctionDeclaration(self, ctx):
         fname = ctx.Identifier().getText()
+
+        # calificar si estamos dentro de otra función
+        if self.fn_stack:
+            fname = f"{self.fn_stack[-1]}.{fname}"
+
         self.b.gen_fn_begin(fname)
-        # cuerpo
-        for st in ctx.block().statement():
-            self.visit(st)
-        # si la función es void y no retornó explícito, gen_fn_end garantiza ret None
+
+        # push
+        self.fn_stack.append(fname)
+        try:
+            for st in ctx.block().statement():
+                self.visit(st)
+        finally:
+            # pop SIEMPRE, aunque haya error
+            self.fn_stack.pop()
+
         self.b.gen_fn_end(fname)
         return None
+
+
 
     def visitClassDeclaration(self, ctx):
         # TAC no materializa clases por ahora (solo accedemos a offsets vía symtab)
         return None
+
+    def visitDoWhileStatement(self, ctx):
+        """
+        Traduce:
+        do <block> while (<expr>);
+        """
+        def body_cb(b):
+            self.visit(ctx.block())
+
+        def cond_cb(b):
+            if ctx.expression():
+                return self.visit(ctx.expression())
+            return self.b.gen_expr_literal(1)
+
+        self.b.gen_stmt_do_while(body_cb, cond_cb)
+        return None
+
+
+    def visitForStatement(self, ctx):
+        """
+        Traduce:
+        for (<init>; <cond>; <update>) <block>
+        donde <init> puede ser variableDeclaration, assignment o ';'
+        """
+
+        def init_cb(b):
+            first = ctx.getChild(2)
+            if isinstance(first, CompiscriptParser.VariableDeclarationContext):
+                self.visit(first)
+            elif isinstance(first, CompiscriptParser.AssignmentContext):
+                self.visit(first)
+            # Si es ';', no hace nada
+
+        def cond_cb(b):
+            exprs = ctx.expression()
+            if len(exprs) >= 1:
+                return self.visit(exprs[0])
+            return self.b.gen_expr_literal(1)
+
+        def step_cb(b):
+            exprs = ctx.expression()
+            if len(exprs) == 2:
+                self.visit(exprs[1])
+
+        def body_cb(b):
+            self.visit(ctx.block())
+
+        self.b.gen_stmt_for(init_cb, cond_cb, step_cb, body_cb)
+        return None
+
+
+
+ 
+    def visitBreakStatement(self, ctx):
+        self.b.gen_stmt_break()
+        return None
+
+    def visitContinueStatement(self, ctx):
+        self.b.gen_stmt_continue()
+        return None
+
+    def visitSwitchStatement(self, ctx):
+        expr = self.visit(ctx.expression())
+        case_blocks = []
+
+        for c in ctx.switchCase():
+            val = self.visit(c.expression())  # no uses int() porque puede no ser literal
+            def cb(b, c=c): 
+                for st in c.statement():
+                    self.visit(st)
+            case_blocks.append((val, cb))
+
+        default_cb = None
+        if ctx.defaultCase():
+            def default_cb(b):
+                for st in ctx.defaultCase().statement():
+                    self.visit(st)
+
+        self.b.gen_stmt_switch(expr, case_blocks, default_cb)
+        return None
+
+
+    def visitArrayLiteral(self, ctx):
+        elems = [self.visit(e) for e in ctx.expression()] if ctx.expression() else []
+        temp_arr = self.b.tmps.new()
+        self.b.tac.emit("alloc_array", Const(len(elems)), None, temp_arr)
+        for i, e in enumerate(elems):
+            idx = self.b.gen_expr_literal(i)
+            self.b.gen_array_store(temp_arr, idx, e)
+        return ExprResult(temp_arr, is_temp=True)
+
+
+
+    def visitThisExpr(self, ctx):
+        # 'this' sin campo explícito
+        return self.b.gen_expr_var("this")
+
+
+
+    def visitTernaryExpr(self, ctx):
+        # Si solo hay 1 hijo, no existe el operador ternario
+        if ctx.getChildCount() == 1:
+            return self.visit(ctx.logicalOrExpr())
+
+        # Si hay ternario (cond ? expr1 : expr2)
+        cond = self.visit(ctx.logicalOrExpr())
+        then_expr = lambda: self.visit(ctx.expression(0))
+        else_expr = lambda: self.visit(ctx.expression(1))
+
+        L_true = self.b.labels.new("Ltern_true")
+        L_false = self.b.labels.new("Ltern_false")
+        L_end = self.b.labels.new("Ltern_end")
+
+        res = self.b.tmps.new()
+        self.b.tac.emit("ifgoto", cond.value, None, L_true)
+        self.b.tac.emit("goto", None, None, L_false)
+
+        self.b.tac.label(L_true)
+        t_then = then_expr()
+        self.b.tac.emit(":=", t_then.value, None, res)
+        self.b.tac.emit("goto", None, None, L_end)
+
+        self.b.tac.label(L_false)
+        t_else = else_expr()
+        self.b.tac.emit(":=", t_else.value, None, res)
+
+        self.b.tac.label(L_end)
+        return ExprResult(res, is_temp=True)
+
+    # assignmentExpr:
+    #   lhs=leftHandSide '=' assignmentExpr            # AssignExpr
+    # | lhs=leftHandSide '.' Identifier '=' assignmentExpr # PropertyAssignExpr
+    # | conditionalExpr                                # ExprNoAssign
+
+    def visitAssignExpr(self, ctx: CompiscriptParser.AssignExprContext):
+        # LHS puede ser Identificador o índice (a[i] = ...)
+        lhs_ctx = ctx.lhs
+        rhs = self.visit(ctx.assignmentExpr())
+
+        # Caso: a[i] = v  (si el último sufijo es IndexExpr)
+        # Inspeccionamos el texto por simplicidad (podrías caminar el AST si prefieres)
+        lhs_text = lhs_ctx.getText()
+        if '[' in lhs_text and lhs_text.endswith(']'):
+            # extraer base e índice: a[i]
+            base = lhs_text[:lhs_text.index('[')]
+            # mejor visitar el índice real del último suffix:
+            # asumimos una sola indexación al final:
+            # buscamos el ÚLTIMO suffix, que es IndexExpr
+            suffixes = list(lhs_ctx.suffixOp())
+            if suffixes and suffixes[-1].expression():
+                idx = self.visit(suffixes[-1].expression())
+                self.b.gen_stmt_assign_index(base, idx, rhs)
+                return rhs
+
+        # Caso general: variable simple
+        if lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
+            var_name = lhs_ctx.primaryAtom().Identifier().getText()
+            self.b._assign(Var(var_name), rhs)
+            return rhs
+
+        # Fallback (si apareciera otra forma)
+        return rhs
+
+
+    def visitPropertyAssignExpr(self, ctx: CompiscriptParser.PropertyAssignExprContext):
+        # obj.prop = expr
+        rhs = self.visit(ctx.assignmentExpr())
+        lhs_ctx = ctx.lhs  # leftHandSide
+        # obj es la cabeza del LHS
+        obj_name = lhs_ctx.primaryAtom().Identifier().getText() if lhs_ctx.primaryAtom().Identifier() else None
+        prop = ctx.Identifier().getText()
+
+        if obj_name:
+            obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+            obj_type_name = obj_sym.type.name if isinstance(obj_sym, VarSymbol) else None
+            off = self.symtab.field_offset(obj_type_name, prop) if obj_type_name else 0
+            self.b.gen_field_store(Var(obj_name), off, rhs)
+        return rhs
+
+
+
+
+
