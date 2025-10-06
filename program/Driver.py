@@ -54,7 +54,7 @@ def main(argv):
         print("Uso: python Driver.py <archivo.cps>")
         return
 
-    
+
     input_stream = FileStream(argv[1], encoding="utf-8")
     lexer = CompiscriptLexer(input_stream)
     stream = CommonTokenStream(lexer)
