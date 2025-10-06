@@ -14,13 +14,19 @@ from program.CompiscriptVisitor import CompiscriptVisitor
 from program.CompiscriptParser import CompiscriptParser
 from contextlib import contextmanager
 
+from program.runtime.activation_record import ActivationRecord
+from program.semantic.symbols import VarSymbol, ParamSymbol, FuncSymbol, ClassSymbol
+from program.semantic.table import SymbolTable
+
 class TypeChecker(CompiscriptVisitor):
     def __init__(self, reporter: ErrorReporter):
         super().__init__()
         self.reporter = reporter
         self.scopes = ScopeStack()
-        self.scopes.push("global")   # GLOBAL AQUI
+        self.scopes.push("global")
         self._current_class: str | None = None
+        self.symtab = SymbolTable(self.scopes)
+        self._current_func: FuncSymbol | None = None 
 
     def define_symbol(self, sym):
         if not self.scopes.stack:
@@ -59,11 +65,20 @@ class TypeChecker(CompiscriptVisitor):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
                                     f"No se puede asignar {init_t} a {vtype}")
             else:
-                sym.is_initialized = True   
+                sym.is_initialized = True
 
         self.define_symbol(sym)
-        return None
 
+        # si estamos dentro de una función/método, asigar offset/región ahora mismo
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(name)
+            slot = ar.addr_of(name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"  # o REG_LOCAL
+
+        return None
 
     def visitConstantDeclaration(self, ctx: CompiscriptParser.ConstantDeclarationContext):
         name = ctx.Identifier().getText()
@@ -80,9 +95,19 @@ class TypeChecker(CompiscriptVisitor):
         if not can_assign(vtype, init_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
                                 f"No se puede asignar {init_t} a {vtype}")
-        self.define_symbol(sym)
-        return None
 
+        self.define_symbol(sym)
+
+        # Si es const local a función, también ocupa un slot de local (inmutable pero vive en el frame)
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(name)
+            slot = ar.addr_of(name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"  # o REG_LOCAL
+
+        return None
 
     def visitAssignment(self, ctx: CompiscriptParser.AssignmentContext):
         exprs = ctx.expression()
@@ -170,8 +195,11 @@ class TypeChecker(CompiscriptVisitor):
             line=ctx.start.line, col=ctx.start.column,
             closure_scope=self.scopes.current
         )
+        prev_func = self._current_func
+        self._current_func = func_sym
         self.define_symbol(func_sym)
 
+        # Registrar funciones anidadas (tu lógica original)
         parent_scope = self.scopes.current
         if hasattr(parent_scope, "func_name") and parent_scope.func_name:
             parent_sym = self.resolve_symbol(parent_scope.func_name)
@@ -180,10 +208,20 @@ class TypeChecker(CompiscriptVisitor):
                     parent_sym.nested = {}
                 parent_sym.nested[name] = func_sym
 
+        # PUSH del scope de función
         self.scopes.push_function(ret_type, name)
+
+        # Capturamos el scope de función "real"
+        func_scope = self.scopes.current
+
+        # Definir símbolos de parámetros en el scope de función (como haces hoy)
         for psym in params:
             self.define_symbol(psym)
 
+        # Crear RA y asignar offsets a THIS (si aplica) + PARÁMETROS
+        self._begin_function_layout(func_sym, func_scope)
+
+        # Visitar cuerpo: tus locales se declaran aquí dentro (en un BlockScope)
         returns = []
         has_terminated = False
         with self._block():
@@ -198,6 +236,12 @@ class TypeChecker(CompiscriptVisitor):
                     returns.append(r or VOID)
                     has_terminated = True
 
+        # Tras visitar el cuerpo, asignar offsets a LOCALES
+        self._finalize_function_layout(func_sym, func_scope)
+        
+        self._current_func = prev_func
+
+        # POP del scope de función
         self.scopes.pop()
 
         if not returns and ret_type != VOID:
@@ -210,6 +254,96 @@ class TypeChecker(CompiscriptVisitor):
                                     f"Return {rt} incompatible con {ret_type}")
 
         return None
+
+    def _begin_function_layout(self, func_sym: FuncSymbol, func_scope):
+        """
+        Crea el AR y asigna offsets a THIS (si aplica) y a todos los parámetros.
+        Además, inyecta un símbolo 'this' (VarSymbol) en el scope del método para
+        poder tomar su dirección en el generador de TAC.
+        """
+        ar = ActivationRecord(func_name=func_sym.name)
+
+        # (1) THIS si es método de clase
+        if self._is_method(func_sym, func_scope):
+            ar.add_this()
+            # inyectar símbolo 'this' en el scope del método
+            this_sym = VarSymbol(
+                "this",
+                Type(self._current_class) if self._current_class else Type("object"),
+                is_const=True, is_initialized=True,
+                region="this",  # o REG_THIS
+                offset=ar.addr_of("this").offset
+            )
+            # defínelo solo si no existe
+            cur = None
+            if hasattr(func_scope, "resolve"):
+                cur = func_scope.resolve("this")
+            elif hasattr(func_scope, "symbols"):
+                cur = func_scope.symbols.get("this")
+            if not cur:
+                if hasattr(func_scope, "define"):
+                    func_scope.define(this_sym)
+                elif hasattr(func_scope, "symbols"):
+                    func_scope.symbols["this"] = this_sym
+
+        # (2) Parámetros en orden
+        for p in func_sym.params:
+            ar.add_param(p.name)
+            slot = ar.addr_of(p.name)
+            if slot:
+                # marca en el símbolo de parámetro
+                p.offset = slot.offset
+                p.region = "param"  # o REG_PARAM
+
+                # si también quieres un VarSymbol sombra (opcional):
+                # vparam = VarSymbol(p.name, p.type, is_const=False, is_initialized=True,
+                #                    region="param", offset=slot.offset)
+                # func_scope.define(vparam)
+
+        func_sym.activation_record = ar
+
+
+    def _finalize_function_layout(self, func_sym: FuncSymbol, func_scope):
+        """
+        Barrido de seguridad: asigna offset local a cualquier VarSymbol del scope
+        de función que aún no tenga offset/region (por ejemplo si se definió sin pasar
+        por visitVariableDeclaration, o si quedó en el scope de función).
+        En este diseño, la idea es asignar locales 'en caliente' en visitVariableDeclaration,
+        por lo que aquí normalmente habrá poco que hacer.
+        """
+        ar = func_sym.activation_record
+        if ar is None:
+            ar = ActivationRecord(func_name=func_sym.name)
+            func_sym.activation_record = ar
+
+        items_iter = []
+        if hasattr(func_scope, "items"):
+            items_iter = list(func_scope.items())
+        elif hasattr(func_scope, "symbols"):
+            items_iter = list(func_scope.symbols.items())
+
+        for name, sym in items_iter:
+            if isinstance(sym, VarSymbol) and sym.region not in ("param", "this", "field", "global"):
+                if sym.offset is None:
+                    ar.add_local(name)
+                    slot = ar.addr_of(name)
+                    if slot:
+                        sym.offset = slot.offset
+                        sym.region = "local"  # o REG_LOCAL
+
+
+    def _is_method(self, func_sym: FuncSymbol, func_scope) -> bool:
+        """
+        Somos un método si estamos dentro de una clase (via _current_class)
+        o si el scope padre es de tipo 'class'.
+        """
+        if self._current_class:
+            return True
+        if len(self.scopes.stack) >= 2:
+            parent = self.scopes.stack[-2]
+            if getattr(parent, "kind", "") == "class":
+                return True
+        return False
 
     def visitReturnStatement(self, ctx):
         # Validar que estemos dentro de una función
@@ -327,39 +461,48 @@ class TypeChecker(CompiscriptVisitor):
         return VOID
 
     def visitCallExpr(self, ctx: CompiscriptParser.CallExprContext):
-        # Recolectar tipos de argumentos
+        # === 1. Recolectar tipos de argumentos ===
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 arg_t = self.visit(e) or VOID
                 args.append(arg_t)
 
-        # Verificar contexto (la llamada siempre cuelga de LeftHandSide)
+        # === 2. Subir al LHS (LeftHandSideContext) ===
         lhs_ctx = ctx.parentCtx
         if not isinstance(lhs_ctx, CompiscriptParser.LeftHandSideContext):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL", "Contexto inválido en llamada")
             return VOID
 
-        # Nombre base (para llamadas del estilo: foo(...))
+        # === 3. Obtener base_name de forma segura ===
         base_name = None
-        if lhs_ctx.primaryAtom() and lhs_ctx.primaryAtom().Identifier():
-            base_name = lhs_ctx.primaryAtom().Identifier().getText()
+        if hasattr(lhs_ctx, "primaryAtom") and lhs_ctx.primaryAtom():
+            atom = lhs_ctx.primaryAtom()
+            if hasattr(atom, "Identifier") and atom.Identifier():
+                base_name = atom.Identifier().getText()
+            elif hasattr(atom, "ThisExpr") or atom.getText() == "this":
+                base_name = "this"
+            else:
+                base_name = None
 
-        # llamada simple:  Identifier '(' args ')'    (no hay más suffixes)
+        # === 4. Caso: llamada simple (foo(args)) ===
         if len(lhs_ctx.suffixOp()) == 1 and lhs_ctx.suffixOp(0) == ctx and base_name is not None:
             sym = self.resolve_symbol(base_name, ctx.start.line, ctx.start.column)
+
+            # Buscar también en scopes anidados
+            if not sym:
+                for scope in reversed(self.scopes.stack):
+                    table = getattr(scope, "symbols", None)
+                    if table and base_name in table and isinstance(table[base_name], FuncSymbol):
+                        sym = table[base_name]
+                        break
+
             if not sym or not isinstance(sym, FuncSymbol):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                    f"{base_name} no es una función")
+                                    f"{base_name} no es una función válida o visible")
                 return VOID
 
-            # Si la función captura un scope
-            pushed = False
-            if sym.closure_scope and sym.closure_scope is not self.scopes.current:
-                self.scopes.push_child(sym.closure_scope)
-                pushed = True
-
-            # Chequeo de aridad y tipos
+            # Validar tipos de argumentos
             if len(args) != len(sym.params):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
                                     f"Número incorrecto de argumentos en {base_name}")
@@ -367,66 +510,69 @@ class TypeChecker(CompiscriptVisitor):
                 for i, (arg_t, param) in enumerate(zip(args, sym.params)):
                     if not can_assign(param.type, arg_t):
                         self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                            f"Argumento {i} incompatible: {arg_t}, se esperaba {param.type}")
-
-            # Desapilar solo si apilamos antes
-            if pushed:
-                self.scopes.pop()
+                                            f"Argumento {i} incompatible en {base_name}: {arg_t}, se esperaba {param.type}")
 
             return sym.type.ret if isinstance(sym.type, FunctionType) else sym.type
 
-        # llamada con acceso previo:  obj . method '(' args ')'  (último suffix es la llamada)
+        # === 5. Caso: llamada de método (obj.metodo(args)) ===
         if len(lhs_ctx.suffixOp()) >= 2 and lhs_ctx.suffixOp()[-1] == ctx:
             prev_suffix = lhs_ctx.suffixOp()[-2]
             if isinstance(prev_suffix, CompiscriptParser.PropertyAccessExprContext):
                 method_name = prev_suffix.Identifier().getText()
-                obj_name = lhs_ctx.primaryAtom().getText()
-                obj_sym = self.resolve_symbol(obj_name, ctx.start.line, ctx.start.column)
+                obj_atom = lhs_ctx.primaryAtom()
 
-                if not obj_sym or not isinstance(obj_sym.type, Type):
+                # --- soporte para this.metodo() ---
+                if obj_atom.getText() == "this":
+                    obj_type = Type(self._current_class) if self._current_class else VOID
+                else:
+                    obj_sym = self.resolve_symbol(obj_atom.getText(), ctx.start.line, ctx.start.column)
+                    obj_type = obj_sym.type if obj_sym else VOID
+
+                if obj_type == VOID:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"{obj_name} no es un objeto válido")
+                                        f"Objeto inválido en llamada a {method_name}")
                     return VOID
 
-                class_sym = self.resolve_symbol(obj_sym.type.name, ctx.start.line, ctx.start.column)
+                class_sym = self.resolve_symbol(obj_type.name, ctx.start.line, ctx.start.column)
                 if not isinstance(class_sym, ClassSymbol):
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"{obj_sym.type.name} no es una clase válida")
+                                        f"{obj_type.name} no es una clase válida")
                     return VOID
 
-                # Buscar método en la jerarquía (herencia)
-                method = None
+                # Buscar método (recursivo por herencia)
                 cur_class = class_sym
+                method = None
                 while isinstance(cur_class, ClassSymbol):
-                    method = cur_class.methods.get(method_name)
-                    if method:
+                    if method_name in cur_class.methods:
+                        method = cur_class.methods[method_name]
                         break
                     if hasattr(cur_class, "base") and cur_class.base:
                         cur_class = self.resolve_symbol(cur_class.base, ctx.start.line, ctx.start.column)
                     else:
-                        cur_class = None
+                        break
 
                 if not method:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"Método {method_name} no definido en {obj_sym.type.name}")
+                                        f"Método {method_name} no definido en {obj_type.name}")
                     return VOID
 
-                # Chequeo de aridad y tipos
+                # Validar aridad y tipos
                 if len(args) != len(method.params):
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                        f"Número incorrecto de argumentos en {obj_sym.type.name}.{method_name}")
+                                        f"Número incorrecto de argumentos en {obj_type.name}.{method_name}")
                 else:
                     for i, (arg_t, param) in enumerate(zip(args, method.params)):
                         if not can_assign(param.type, arg_t):
                             self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
-                                                f"Argumento {i} incompatible en {obj_sym.type.name}.{method_name}: {arg_t} esperado {param.type}")
+                                                f"Argumento {i} incompatible en {obj_type.name}.{method_name}: {arg_t} esperado {param.type}")
 
                 return method.type.ret if isinstance(method.type, FunctionType) else method.type
 
-        # Si ninguna forma reconocida matcheó
+        # === 6. Fallback ===
         self.reporter.report(ctx.start.line, ctx.start.column, "E_CALL",
                             f"Llamada inválida{f' en {base_name}' if base_name else ''}")
         return VOID
+
 
 
     def visitIdentifierExpr(self, ctx: CompiscriptParser.IdentifierExprContext):
@@ -444,6 +590,8 @@ class TypeChecker(CompiscriptVisitor):
                 if not sym.is_initialized and not sym.is_const:
                     self.reporter.report(ctx.start.line, ctx.start.column, "E_UNINIT",
                                         f"Variable '{name}' usada antes de ser inicializada")
+                return sym.type
+            if isinstance(sym, ParamSymbol):
                 return sym.type
             if isinstance(sym, FuncSymbol):
                 return sym.type  
@@ -473,24 +621,37 @@ class TypeChecker(CompiscriptVisitor):
             if member.functionDeclaration():
                 fname = member.functionDeclaration().Identifier().getText()
                 ret_type = self.visit(member.functionDeclaration().type_()) if member.functionDeclaration().type_() else VOID
-                
+
                 params = []
                 if member.functionDeclaration().parameters():
                     for i, p in enumerate(member.functionDeclaration().parameters().parameter()):
                         pname = p.Identifier().getText()
                         ptype = self.visit(p.type_()) if p.type_() else VOID
                         params.append(ParamSymbol(pname, ptype, i,
-                                                line=p.start.line, col=p.start.column))
-                
+                                                 line=p.start.line, col=p.start.column))
+
                 func_type = make_fn([p.type for p in params], ret_type)
                 fsym = FuncSymbol(fname, type=func_type, params=tuple(params),
-                                line=member.start.line, col=member.start.column)
+                                  line=member.start.line, col=member.start.column)
                 csym.methods[fname] = fsym
 
+                # PUSH del scope de función del método
                 self.scopes.push_function(ret_type, fname)
+                func_scope = self.scopes.current
+
                 for psym in params:
                     self.define_symbol(psym)
+
+                # RA para método (detectará THIS por _is_method)
+                self._begin_function_layout(fsym, func_scope)
+
+                # Cuerpo del método
                 self.visit(member.functionDeclaration().block())
+
+                # Offsets de locales del método
+                self._finalize_function_layout(fsym, func_scope)
+
+                # POP del scope de función
                 self.scopes.pop()
 
             elif member.variableDeclaration():
@@ -507,6 +668,18 @@ class TypeChecker(CompiscriptVisitor):
                 csym.fields[cname] = VarSymbol(cname, ctype, is_const=True, is_initialized=True,
                                             line=member.start.line, col=member.start.column)
                 self.define_symbol(csym.fields[cname])
+
+        # Calcula el desplazamiento base por herencia
+        base_field_count = 0
+        if csym.base:
+            base_sym = self.resolve_symbol(csym.base, ctx.start.line, ctx.start.column)
+            if isinstance(base_sym, ClassSymbol):
+                base_field_count = len(base_sym.fields)
+
+        # Asigna field_offset a los campos de ESTA clase por orden de declaración
+        for i, (fname, fsym) in enumerate(csym.fields.items()):
+            if isinstance(fsym, VarSymbol):
+                fsym.field_offset = base_field_count + i
 
         self.scopes.pop()
         self._current_class = prev
@@ -684,6 +857,15 @@ class TypeChecker(CompiscriptVisitor):
                         line=ctx.start.line, col=ctx.start.column)
         self.define_symbol(sym)
 
+        # tras self.define_symbol(sym)
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(var_name)
+            slot = ar.addr_of(var_name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"
+
         self.scopes.push("loop")
         self.visit(ctx.block())
         self.scopes.pop()
@@ -730,8 +912,15 @@ class TypeChecker(CompiscriptVisitor):
         self.scopes.pop()
         return None
 
-
     def visitIndexExpr(self, ctx: CompiscriptParser.IndexExprContext):
+        """
+        Maneja expresiones de indexación de arreglos, como:
+            a[0], m[1][2], etc.
+
+        Valida que el índice sea integer y que el objeto sea un arreglo.
+        Soporta arreglos multidimensionales (integer[][] -> integer[] -> integer).
+        """
+        # === 1. Resolver el nombre base del arreglo ===
         lhs_ctx = ctx.parentCtx.primaryAtom()
         if lhs_ctx and lhs_ctx.Identifier():
             arr_name = lhs_ctx.Identifier().getText()
@@ -740,18 +929,33 @@ class TypeChecker(CompiscriptVisitor):
         else:
             arr_t = VOID
 
+        # === 2. Verificar el tipo del índice ===
         idx_t = self.visit(ctx.expression()) or VOID
         if idx_t != INTEGER:
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"Índice debe ser integer, no {idx_t}")
 
+        # === 3. Validar que el objeto sea un arreglo ===
         if not is_array(arr_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_INDEX",
                                 f"El objeto {arr_t} no es indexable")
             return VOID
 
+        # === 4. Si es un arreglo multidimensional, reducir una dimensión ===
+        if isinstance(arr_t, ArrayType):
+            # integer[][] → integer[]
+            if arr_t.dims > 1:
+                return make_array(arr_t.elem, arr_t.dims - 1)
+            # integer[] → integer
+            else:
+                return arr_t.elem
+
+        # === 5. Caso general (por compatibilidad con tipos antiguos) ===
         elem_t = element_type(arr_t) or VOID
         return elem_t
+
+
+
 
     def visitUnaryExpr(self, ctx: CompiscriptParser.UnaryExprContext):
         if ctx.getChildCount() == 2:  
@@ -769,28 +973,66 @@ class TypeChecker(CompiscriptVisitor):
         else:
             return self.visit(ctx.primaryExpr()) or VOID
 
+
     def visitPropertyAccessExpr(self, ctx: CompiscriptParser.PropertyAccessExprContext):
+        """
+        Traduce expresiones del tipo:
+            obj.prop
+            this.prop
+        y retorna el tipo del campo o método correspondiente.
+        """
         lhs_ctx = ctx.parentCtx
         obj_t = VOID
+
+        # === 1. Determinar el tipo del objeto base ===
         if isinstance(lhs_ctx, CompiscriptParser.LeftHandSideContext):
             if lhs_ctx.primaryAtom():
-                obj_t = self.visit(lhs_ctx.primaryAtom()) or VOID
+                atom = lhs_ctx.primaryAtom()
+                txt = atom.getText()
+
+                # Caso especial: this.prop
+                if txt == "this":
+                    if not self._current_class:
+                        self.reporter.report(ctx.start.line, ctx.start.column, "E_THIS",
+                                            "Uso de 'this' fuera de una clase")
+                        return VOID
+                    obj_t = Type(self._current_class)
+                elif hasattr(atom, "Identifier") and atom.Identifier():
+                    base_name = atom.Identifier().getText()
+                    sym = self.resolve_symbol(base_name, ctx.start.line, ctx.start.column)
+                    obj_t = sym.type if isinstance(sym, VarSymbol) else VOID
+                else:
+                    obj_t = VOID
 
         prop_name = ctx.Identifier().getText()
 
+        # === 2. Si el objeto es de tipo clase, buscar campo o método ===
         if isinstance(obj_t, Type):
             class_sym = self.resolve_symbol(obj_t.name, ctx.start.line, ctx.start.column)
-            while isinstance(class_sym, ClassSymbol):   
+            while isinstance(class_sym, ClassSymbol):
+                # Buscar en campos
                 if prop_name in class_sym.fields:
                     return class_sym.fields[prop_name].type
+                # Buscar en métodos
                 if prop_name in class_sym.methods:
                     return class_sym.methods[prop_name].type
+                # Buscar en la clase base
                 if hasattr(class_sym, "base") and class_sym.base:
                     class_sym = self.resolve_symbol(class_sym.base, ctx.start.line, ctx.start.column)
                 else:
                     break
+
+            # Si no se encontró el campo ni método
+            self.reporter.report(ctx.start.line, ctx.start.column, "E_PROP",
+                                f"Propiedad o método '{prop_name}' no definido en {obj_t.name}")
+            return VOID
+
+        # === 3. Si no es clase, error ===
+        self.reporter.report(ctx.start.line, ctx.start.column, "E_PROP",
+                            f"No se puede acceder a la propiedad '{prop_name}' de {obj_t}")
         return VOID
 
+ 
     def visitLeftHandSide(self, ctx: CompiscriptParser.LeftHandSideContext):
         t = self.visit(ctx.primaryAtom()) or VOID
         for suffix in ctx.suffixOp():

@@ -1,3 +1,4 @@
+# program/ir/tac_ir.py
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
@@ -30,10 +31,12 @@ class Temp(Operand):
 
 @dataclass(frozen=True)
 class Addr(Operand):
-    base: Operand
+    base: Union[Operand, str]
     offset: int
     def __repr__(self) -> str:
-        return f"&({self.base}+{self.offset})"
+        base = str(self.base)
+        sign = "+" if self.offset >= 0 else ""
+        return f"[{base}{sign}{self.offset}]"
 
 @dataclass(frozen=True)
 class Label(Operand):
@@ -58,13 +61,28 @@ class Quadruple:
         if self.op == "param":
             return f"param {self.a}"
         if self.op == "call":
-            return f"call {self.a}, nargs={self.b} -> {self.dst}"
+            # mejora: si no hay destino, no imprimas "-> None"
+            return (f"call {self.a}, nargs={self.b}"
+                    if self.dst is None
+                    else f"call {self.a}, nargs={self.b} -> {self.dst}")
         if self.op == "ret":
             return f"ret {self.a}"
         if self.op == "print":
             return f"print {self.a}"
         if self.op == ":=":
             return f"{self.dst} := {self.a}"
+        if self.op == "load":
+            return f"load {self.a} -> {self.dst}"
+        if self.op == "store":
+            # *** clave: imprime la dirección en 'b' ***
+            return f"store {self.a}, {self.b}"
+        if self.op == "alloc":
+            return f"alloc {self.a} -> {self.dst}"
+        if self.op == "alloc_array":
+            return f"alloc_array {self.a} -> {self.dst}"
+        if self.op == "len":
+            return f"len {self.a} -> {self.dst}"
+        # Los de 3 operandos (addr_field/index, +, -, etc.)
         return f"{self.op} {self.a}, {self.b} -> {self.dst}"
 
 @dataclass

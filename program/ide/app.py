@@ -1,15 +1,25 @@
 import sys, os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 import streamlit as st
 from antlr4 import InputStream, CommonTokenStream
 from antlr4.tree.Trees import Trees
-from CompiscriptLexer import CompiscriptLexer
-from CompiscriptParser import CompiscriptParser
-from semantic.type_checker import TypeChecker
-from semantic.error_reporter import ErrorReporter
-from semantic.scopes import GlobalScope
-from semantic.symbols import FuncSymbol, ClassSymbol, VarSymbol
+import pandas as pd
 
+from program.CompiscriptLexer import CompiscriptLexer
+from program.CompiscriptParser import CompiscriptParser
+from program.semantic.type_checker import TypeChecker
+from program.semantic.error_reporter import ErrorReporter
+from program.semantic.scopes import GlobalScope
+from program.semantic.symbols import FuncSymbol, ClassSymbol, VarSymbol
+from program.semantic.table import SymbolTable
+from program.ir.tac_builder import TACBuilder
+from program.ir.tac_gen import TACGen
+
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 # --- Graphviz helpers ---
 def _node_label(parser, node) -> str:
@@ -60,7 +70,8 @@ def compile_code(source: str):
     checker = TypeChecker(reporter)
     checker.visit(tree)
 
-    return reporter, checker.scopes, parser, tree
+    return reporter, checker.scopes, checker.symtab, parser, tree
+
 
 def render_scope(scope, container, indent=0):
     pad = " " * (indent * 2)
@@ -164,6 +175,13 @@ def render_symbols(scopes, st):
     else:
         st.info("No hay funciones globales.")
 
+def _fmt_addr(sym):
+    off = getattr(sym, "offset", None)
+    reg = getattr(sym, "region", None)
+    if off is None or reg not in ("param","local","this"):
+        return ""
+    sign = "+" if int(off) >= 0 else ""
+    return f"[fp{sign}{int(off)}]"
 
 
 st.set_page_config(page_title="Compiscript IDE", layout="wide")
@@ -194,11 +212,12 @@ with col_a:
     do_compile = st.button("Compile 🚀", key="compile_main")
 with col_b:
     show_tree = st.checkbox("Árbol sintáctico", value=True)
+    show_tac  = st.checkbox("Generar TAC", value=True)
 with col_c:
     max_nodes = st.slider("Límite de nodos del árbol", min_value=200, max_value=5000, value=2000, step=100)
 
 if do_compile:
-    reporter, scopes, parser, tree = compile_code(code)
+    reporter, scopes, symtab, parser, tree = compile_code(code)
 
     if reporter.has_errors():
         st.error(" Errores semánticos encontrados:")
@@ -211,21 +230,90 @@ if do_compile:
         st.subheader("Árbol sintáctico")
         dot = build_parse_tree_dot(parser, tree, max_nodes=max_nodes)
         st.graphviz_chart(dot, use_container_width=True)
+    
+    # Generación de TAC (solo si no hay errores)
+    if show_tac and not reporter.has_errors():
+        st.subheader("TAC")
+        # Usamos la tabla de símbolos a partir de 'scopes'
+        builder = TACBuilder()
+        gen     = TACGen(symtab, builder)
+        gen.visit(tree)
+        st.code(builder.tac.dump(), language="text")
 
     # Tabla de símbolos por scope
     for scope in scopes.stack:
         st.subheader(f"Scope: {scope.kind}")
-        rows = [
-            {
+
+        rows = []
+        for _, sym in scope.items():
+            row = {
                 "Category": sym.category,
                 "Name": sym.name,
                 "Type": str(sym.type),
-                "Line": sym.line,
-                "Col": sym.col
+                "Region": getattr(sym, "region", None),
+                "Addr": _fmt_addr(sym),   
+                "Offset": getattr(sym, "offset", None),
+                "Line": getattr(sym, "line", 0),
+                "Col": getattr(sym, "col", 0),
             }
-            for _, sym in scope.items()
-        ]
-        st.table(rows)
+            rows.append(row)
+
+            # Parámetros si es función
+            if isinstance(sym, FuncSymbol):
+                for p in sym.params:
+                    rows.append({
+                        "Category": "param",
+                        "Name": p.name,
+                        "Type": str(p.type),
+                        "Region": "param" if getattr(p, "offset", None) is not None else None,
+                        "Offset": getattr(p, "offset", None),
+                        "Line": getattr(p, "line", 0),
+                        "Col": getattr(p, "col", 0),
+                    })
+
+                # Activation Record (si existe)
+                if getattr(sym, "activation_record", None):
+                    ar = sym.activation_record
+                    with st.expander(f"AR de {sym.name}"):
+                        st.write(
+                            f"**has_this**={ar.has_this}, "
+                            f"**params_size**={ar.params_size}, "
+                            f"**locals_size**={ar.locals_size}, "
+                            f"**frame_size**={ar.frame_size}"
+                        )
+
+            # Si es clase, listar campos y métodos (y AR de métodos si lo hay)
+            if isinstance(sym, ClassSymbol):
+                if getattr(sym, "fields", None):
+                    st.markdown(f"**Campos de `{sym.name}`**")
+                    st.table([{
+                        "Name": fname,
+                        "Type": str(fsym.type),
+                        "field_offset": getattr(fsym, "field_offset", None),
+                    } for fname, fsym in sym.fields.items()])
+
+                if getattr(sym, "methods", None):
+                    st.markdown(f"**Métodos de `{sym.name}`**")
+                    st.table([{
+                        "Name": mname,
+                        "Type": str(msym.type),
+                        "Params": ", ".join(f"{p.name}: {p.type}" for p in msym.params),
+                    } for mname, msym in sym.methods.items()])
+
+                    # AR por método
+                    for mname, msym in sym.methods.items():
+                        if getattr(msym, "activation_record", None):
+                            ar = msym.activation_record
+                            with st.expander(f"AR de {sym.name}.{mname}"):
+                                st.write(
+                                    f"**has_this**={ar.has_this}, "
+                                    f"**params_size**={ar.params_size}, "
+                                    f"**locals_size**={ar.locals_size}, "
+                                    f"**frame_size**={ar.frame_size}"
+                                )
+
+        if rows:
+            st.table(rows)
 
     # mostrar parámetros de cada función declarada en el scope global
     # ---- Mostrar clases y sus miembros (en el global)

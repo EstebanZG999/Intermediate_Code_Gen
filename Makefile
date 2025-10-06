@@ -89,3 +89,6 @@ ide: docker-build gen
 	    export PYTHONPATH=/workspace:/workspace/program && \
 	    streamlit run app.py --server.port=8501 --server.address=0.0.0.0 \
 	  '
+driver:
+	python -m program.Driver program/program_ok.cps
+
