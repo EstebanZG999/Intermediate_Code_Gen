@@ -26,6 +26,7 @@ class TypeChecker(CompiscriptVisitor):
         self.scopes.push("global")
         self._current_class: str | None = None
         self.symtab = SymbolTable(self.scopes)
+        self._current_func: FuncSymbol | None = None 
 
     def define_symbol(self, sym):
         if not self.scopes.stack:
@@ -64,11 +65,20 @@ class TypeChecker(CompiscriptVisitor):
                 self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
                                     f"No se puede asignar {init_t} a {vtype}")
             else:
-                sym.is_initialized = True   
+                sym.is_initialized = True
 
         self.define_symbol(sym)
-        return None
 
+        # si estamos dentro de una función/método, asigar offset/región ahora mismo
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(name)
+            slot = ar.addr_of(name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"  # o REG_LOCAL
+
+        return None
 
     def visitConstantDeclaration(self, ctx: CompiscriptParser.ConstantDeclarationContext):
         name = ctx.Identifier().getText()
@@ -85,9 +95,19 @@ class TypeChecker(CompiscriptVisitor):
         if not can_assign(vtype, init_t):
             self.reporter.report(ctx.start.line, ctx.start.column, "E_ASSIGN",
                                 f"No se puede asignar {init_t} a {vtype}")
-        self.define_symbol(sym)
-        return None
 
+        self.define_symbol(sym)
+
+        # Si es const local a función, también ocupa un slot de local (inmutable pero vive en el frame)
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(name)
+            slot = ar.addr_of(name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"  # o REG_LOCAL
+
+        return None
 
     def visitAssignment(self, ctx: CompiscriptParser.AssignmentContext):
         exprs = ctx.expression()
@@ -175,6 +195,8 @@ class TypeChecker(CompiscriptVisitor):
             line=ctx.start.line, col=ctx.start.column,
             closure_scope=self.scopes.current
         )
+        prev_func = self._current_func
+        self._current_func = func_sym
         self.define_symbol(func_sym)
 
         # Registrar funciones anidadas (tu lógica original)
@@ -216,6 +238,8 @@ class TypeChecker(CompiscriptVisitor):
 
         # Tras visitar el cuerpo, asignar offsets a LOCALES
         self._finalize_function_layout(func_sym, func_scope)
+        
+        self._current_func = prev_func
 
         # POP del scope de función
         self.scopes.pop()
@@ -233,73 +257,65 @@ class TypeChecker(CompiscriptVisitor):
 
     def _begin_function_layout(self, func_sym: FuncSymbol, func_scope):
         """
-        Crea el ActivationRecord y registra THIS (si aplica) + PARÁMETROS (con offsets).
-        Si no existe un VarSymbol para el parámetro, crea uno 'sombra' para poder usar addr_of en TAC.
+        Crea el AR y asigna offsets a THIS (si aplica) y a todos los parámetros.
+        Además, inyecta un símbolo 'this' (VarSymbol) en el scope del método para
+        poder tomar su dirección en el generador de TAC.
         """
         ar = ActivationRecord(func_name=func_sym.name)
 
         # (1) THIS si es método de clase
         if self._is_method(func_sym, func_scope):
             ar.add_this()
-            # si modelas 'this' como VarSymbol en el scope, opcionalmente sincroniza:
-            if "this" in getattr(func_scope, "symbols", {}) or "this" in func_scope:
-                vs = func_scope["this"]
-                if isinstance(vs, VarSymbol):
-                    slot = ar.addr_of("this")
-                    if slot:
-                        vs.offset = slot.offset
-                        vs.region = "this"
+            # inyectar símbolo 'this' en el scope del método
+            this_sym = VarSymbol(
+                "this",
+                Type(self._current_class) if self._current_class else Type("object"),
+                is_const=True, is_initialized=True,
+                region="this",  # o REG_THIS
+                offset=ar.addr_of("this").offset
+            )
+            # defínelo solo si no existe
+            cur = None
+            if hasattr(func_scope, "resolve"):
+                cur = func_scope.resolve("this")
+            elif hasattr(func_scope, "symbols"):
+                cur = func_scope.symbols.get("this")
+            if not cur:
+                if hasattr(func_scope, "define"):
+                    func_scope.define(this_sym)
+                elif hasattr(func_scope, "symbols"):
+                    func_scope.symbols["this"] = this_sym
 
         # (2) Parámetros en orden
         for p in func_sym.params:
             ar.add_param(p.name)
-            # Buscar un VarSymbol homónimo en el scope de función
-            vs = None
-            if hasattr(func_scope, "get"):
-                vs = func_scope.get(p.name, None)
-            else:
-                # si tu Scope es dict-like
-                vs = func_scope.symbols.get(p.name) if hasattr(func_scope, "symbols") else None
+            slot = ar.addr_of(p.name)
+            if slot:
+                # marca en el símbolo de parámetro
+                p.offset = slot.offset
+                p.region = "param"  # o REG_PARAM
 
-            if isinstance(vs, VarSymbol):
-                slot = ar.addr_of(p.name)
-                if slot:
-                    vs.offset = slot.offset
-                    vs.region = "param"
-            else:
-                # Crear una variable 'sombra' para TAC
-                vparam = VarSymbol(p.name, p.type, is_const=False, is_initialized=True)
-                slot = ar.addr_of(p.name)
-                if slot:
-                    vparam.offset = slot.offset
-                    vparam.region = "param"
-                # insertar en el scope
-                if hasattr(func_scope, "define"):
-                    func_scope.define(vparam)
-                elif hasattr(func_scope, "insert"):
-                    func_scope.insert(p.name, vparam)
-                else:
-                    # fallback si func_scope es dict-like
-                    if hasattr(func_scope, "symbols"):
-                        func_scope.symbols[p.name] = vparam
-                    else:
-                        func_scope[p.name] = vparam
+                # si también quieres un VarSymbol sombra (opcional):
+                # vparam = VarSymbol(p.name, p.type, is_const=False, is_initialized=True,
+                #                    region="param", offset=slot.offset)
+                # func_scope.define(vparam)
 
-        # Colgar el RA en el símbolo de función
         func_sym.activation_record = ar
 
 
     def _finalize_function_layout(self, func_sym: FuncSymbol, func_scope):
         """
-        Tras visitar el cuerpo, asigna offsets a todas las variables locales (no param/this).
-        Observación: tus locales se suelen declarar dentro de un BlockScope; recógelos.
+        Barrido de seguridad: asigna offset local a cualquier VarSymbol del scope
+        de función que aún no tenga offset/region (por ejemplo si se definió sin pasar
+        por visitVariableDeclaration, o si quedó en el scope de función).
+        En este diseño, la idea es asignar locales 'en caliente' en visitVariableDeclaration,
+        por lo que aquí normalmente habrá poco que hacer.
         """
         ar = func_sym.activation_record
         if ar is None:
             ar = ActivationRecord(func_name=func_sym.name)
             func_sym.activation_record = ar
 
-        # 1) Asignar a locales del scope de función (si hay)
         items_iter = []
         if hasattr(func_scope, "items"):
             items_iter = list(func_scope.items())
@@ -307,21 +323,22 @@ class TypeChecker(CompiscriptVisitor):
             items_iter = list(func_scope.symbols.items())
 
         for name, sym in items_iter:
-            if isinstance(sym, VarSymbol) and sym.region not in ("param", "this"):
-                ar.add_local(name)
-                slot = ar.addr_of(name)
-                if slot:
-                    sym.offset = slot.offset
-                    sym.region = "local"
+            if isinstance(sym, VarSymbol) and sym.region not in ("param", "this", "field", "global"):
+                if sym.offset is None:
+                    ar.add_local(name)
+                    slot = ar.addr_of(name)
+                    if slot:
+                        sym.offset = slot.offset
+                        sym.region = "local"  # o REG_LOCAL
+
 
     def _is_method(self, func_sym: FuncSymbol, func_scope) -> bool:
         """
-        Heurística: estamos dentro de una clase si self._current_class no es None,
+        Somos un método si estamos dentro de una clase (via _current_class)
         o si el scope padre es de tipo 'class'.
         """
         if self._current_class:
             return True
-        # chequeo por parent scope si tu ScopeStack lo permite
         if len(self.scopes.stack) >= 2:
             parent = self.scopes.stack[-2]
             if getattr(parent, "kind", "") == "class":
@@ -839,6 +856,15 @@ class TypeChecker(CompiscriptVisitor):
         sym = VarSymbol(var_name, elem_t, is_const=False, is_initialized=True,
                         line=ctx.start.line, col=ctx.start.column)
         self.define_symbol(sym)
+
+        # tras self.define_symbol(sym)
+        if self.scopes.inside("function") and self._current_func and self._current_func.activation_record:
+            ar = self._current_func.activation_record
+            ar.add_local(var_name)
+            slot = ar.addr_of(var_name)
+            if slot:
+                sym.offset = slot.offset
+                sym.region = "local"
 
         self.scopes.push("loop")
         self.visit(ctx.block())
