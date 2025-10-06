@@ -54,45 +54,35 @@ def main(argv):
         print("Uso: python Driver.py <archivo.cps>")
         return
 
-
     input_stream = FileStream(argv[1], encoding="utf-8")
     lexer = CompiscriptLexer(input_stream)
-    stream = CommonTokenStream(lexer)
-    parser = CompiscriptParser(stream)
+    tokens = CommonTokenStream(lexer)
+    parser = CompiscriptParser(tokens)
 
-    
     tree = parser.program()
 
-    
     reporter = ErrorReporter()
     checker = TypeChecker(reporter)
-
-    
     checker.visit(tree)
 
-    
     if reporter.has_errors():
         print("\nErrores semánticos encontrados:")
         for e in reporter:
             print("   ", e)
-    else:
-        print("\nAnálisis semántico completado sin errores.")
+        return
 
-    
-    print_symbol_table(checker.scopes)
+    print("\nAnálisis semántico completado sin errores.")
 
-    # Si no hubo errores semánticos, generar TAC
-    if not reporter.has_errors():
-        print("\n=== Generación de Código Intermedio (TAC) ===")
-        builder = TACBuilder()
+    # ✅ Usar la symtab del checker (ya trae offsets y ActivationRecord)
+    print("\n=== Tabla de Símbolos (con offsets) ===")
+    print_symbol_table(checker.scopes)  # si tu print usa scopes; si tienes uno que acepta symtab, úsalo
 
-        from program.semantic.table import SymbolTable
-        symtab = SymbolTable(checker.scopes)
-        gen = TACGen(symtab, builder)
-
-
-        gen.visit(tree)
-        print(builder.tac)
+    # ✅ Generación de TAC usando la symtab del checker
+    print("\n=== Generación de Código Intermedio (TAC) ===")
+    builder = TACBuilder()
+    gen = TACGen(checker.symtab, builder)   # ← usa la symtab del checker, no reconstruyas
+    gen.visit(tree)
+    print(builder.tac)
 
 if __name__ == "__main__":
     main(sys.argv)
