@@ -236,19 +236,31 @@ class TACGen(CompiscriptVisitor):
                 self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
                 return ExprResult(tmp, is_temp=True)
 
-            # 3) Si el LHS no existe (llamada directa en expresión)
-            if ctx.Identifier():
-                func_name = ctx.Identifier().getText()
-                # calificar si estamos dentro de función anidada
+            # 3) Si el LHS no existe (llamada directa tipo foo(...))
+            try:
+                parent_atom = None
+                if hasattr(ctx.parentCtx, "parentCtx") and hasattr(ctx.parentCtx.parentCtx, "primaryAtom"):
+                    parent_atom = ctx.parentCtx.parentCtx.primaryAtom()
+                elif hasattr(ctx.parentCtx, "primaryAtom"):
+                    parent_atom = ctx.parentCtx.primaryAtom()
+
+                if parent_atom and parent_atom.Identifier():
+                    func_name = parent_atom.Identifier().getText()
+                else:
+                    func_name = ctx.getText().split("(", 1)[0]  # fallback textual
+
+                # Calificar si estamos dentro de función anidada
                 callee_name = f"{self.fn_stack[-1]}.{func_name}" if self.fn_stack else func_name
+
                 for a in args:
                     self.b.tac.emit("param", a.value)
+
                 tmp = self.b.tmps.new()
                 self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
                 return ExprResult(tmp, is_temp=True)
-
-            # 4) fallback final
-            return self.b.gen_expr_literal(0)
+            except Exception as e:
+                print(f"[WARN] CallExpr fallback: {e}")
+                return self.b.gen_expr_literal(0)
 
 
 
@@ -256,16 +268,30 @@ class TACGen(CompiscriptVisitor):
  
     # ---------- Statements ----------
     def visitVariableDeclaration(self, ctx):
+        """
+        Traduce declaraciones tipo:
+        var x = expr;
+        var arr = [1,2,3];
+        """
         name = ctx.Identifier().getText()
         if ctx.initializer():
             init = ctx.initializer()
-            if init.arrayLiteral():
-                rhs = self.visit(init.arrayLiteral())
+
+            # Verificamos si el initializer contiene un array literal
+            expr = init.expression()
+            if expr and expr.getChildCount() > 0:
+                # Buscar si el primer hijo es un arrayLiteral
+                first_child = expr.getChild(0)
+                if isinstance(first_child, CompiscriptParser.ArrayLiteralContext):
+                    rhs = self.visit(first_child)
+                else:
+                    rhs = self.visit(expr)
             else:
-                rhs = self.visit(init.expression())
-            if rhs is None:
-                rhs = ExprResult(Const(0), is_temp=False)
-            self.b._assign(Var(name), rhs)
+                rhs = self.b.gen_expr_literal(0)
+        else:
+            rhs = self.b.gen_expr_literal(0)
+
+        self.b._assign(Var(name), rhs)
         return None
 
 
