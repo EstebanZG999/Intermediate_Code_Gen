@@ -149,27 +149,44 @@ class TACGen(CompiscriptVisitor):
 
 
     def visitPropertyAccessExpr(self, ctx):
+        """
+        Traduce accesos a propiedades o métodos:
+          - this.campo
+          - obj.campo
+          - obj.metodo (referencia simbólica)
+        """
         lhs_ctx = ctx.parentCtx
-        obj_expr = self.visit(lhs_ctx.primaryAtom())
         field_name = ctx.Identifier().getText()
+        lhs_text = lhs_ctx.getText()
 
-        # Obtener tipo del objeto
+        # --- Caso 1: this.campo ---
+        if lhs_text.startswith("this."):
+            cls_name = self.fn_stack[0].split('.')[0] if self.fn_stack else None
+            off = self.symtab.field_offset(cls_name, field_name) if cls_name else 0
+            return self.b.gen_field_load(Var("this"), off)
+
+        # --- Caso 2: obj.campo ---
+        # Intentamos visitar la base del objeto
+        obj_expr = self.visit(lhs_ctx.primaryAtom())
+
+        # Si el objeto es variable, obtener su tipo desde la tabla de símbolos
         if isinstance(obj_expr.value, Var):
             var_sym = self.symtab.scope_stack.current.resolve(obj_expr.value.name)
             obj_type_name = var_sym.type.name if isinstance(var_sym, VarSymbol) else None
         else:
             obj_type_name = None
 
+        # Si no se conoce tipo, devolvemos literal 0
         if obj_type_name is None:
             return self.b.gen_expr_literal(0)
 
-        # --- NUEVO BLOQUE: si es método, no pidas field_offset ---
+        # Si el campo es un método declarado en la clase
         cls = self.symtab._resolve_class(obj_type_name)
         if cls and field_name in cls.methods:
-            # devolvemos referencia simbólica al método (no field)
+            # devolver referencia simbólica al método
             return self.b.gen_expr_var(f"{obj_type_name}.{field_name}")
 
-        # Si no es método, tratamos como campo normal
+        # Caso general: campo normal
         off = self.symtab.field_offset(obj_type_name, field_name)
         return self.b.gen_field_load(obj_expr.value, off)
 
@@ -185,82 +202,73 @@ class TACGen(CompiscriptVisitor):
 
     def visitCallExpr(self, ctx):
         """
-        - foo(args)               → función global o local calificada si estamos dentro de otra función
-        - obj.metodo(args)        → método con this como primer argumento
+        Genera TAC para llamadas a funciones o métodos.
+        Casos soportados:
+          - f(args)
+          - obj.metodo(args)
+          - this.metodo(args)
         """
-        # 1) argumentos
+        # Recolectar argumentos
         args = []
         if ctx.arguments():
             for e in ctx.arguments().expression():
                 args.append(self.visit(e))
 
-        # 2) subir al LHS (SuffixOp(Call) -> LeftHandSide)
+        # Determinar el contexto padre
         parent = ctx.parentCtx
         lhs = getattr(parent, "parentCtx", None)
-        if lhs is not None:
-            lhs_text = lhs.getText()
+        lhs_text = lhs.getText() if lhs else ctx.getText()
 
-            # 2a) llamada a método obj.metodo(...)
-            if "." in lhs_text:
-                before_paren = lhs_text.split("(", 1)[0]
-                obj_name, method_name = before_paren.split(".", 1)
+        # --- Caso 1: llamada tipo this.metodo() ---
+        if lhs_text.startswith("this."):
+            _, method_name = lhs_text.split(".", 1)
+            self.b.tac.emit("param", Var("this"))
+            for a in args:
+                self.b.tac.emit("param", a.value)
+            tmp = self.b.tmps.new()
+            # calificar con la clase actual si se conoce (por fn_stack)
+            cls_name = self.fn_stack[0].split('.')[0] if self.fn_stack else "global"
+            callee = f"{cls_name}.{method_name}"
+            self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
+            return ExprResult(tmp, is_temp=True)
 
-                # intenta resolver el tipo del objeto
-                obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
-                obj_type = obj_sym.type.name if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name") else None
+        # --- Caso 2: llamada tipo obj.metodo() ---
+        if "." in lhs_text and not lhs_text.startswith("this."):
+            before_paren = lhs_text.split("(", 1)[0]
+            obj_name, method_name = before_paren.split(".", 1)
 
-                # this + args
-                self.b.tac.emit("param", Var(obj_name))
-                for a in args:
-                    self.b.tac.emit("param", a.value)
+            # Resuelve tipo del objeto (si es símbolo conocido)
+            obj_sym = self.symtab.scope_stack.current.resolve(obj_name)
+            obj_type = obj_sym.type.name if isinstance(obj_sym, VarSymbol) and hasattr(obj_sym.type, "name") else None
 
-                tmp = self.b.tmps.new()
-                callee = f"{obj_type}.{method_name}" if obj_type else f"{obj_name}.{method_name}"
-                self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
-                return ExprResult(tmp, is_temp=True)
+            # Pasa this (obj) y los demás argumentos
+            self.b.tac.emit("param", Var(obj_name))
+            for a in args:
+                self.b.tac.emit("param", a.value)
 
-            # 2b) función (foo(args))
-            if hasattr(lhs, "primaryAtom") and lhs.primaryAtom() and lhs.primaryAtom().Identifier():
-                base_name = lhs.primaryAtom().Identifier().getText()
+            tmp = self.b.tmps.new()
+            callee = f"{obj_type}.{method_name}" if obj_type else f"{obj_name}.{method_name}"
+            self.b.tac.emit("call", Const(callee), Const(len(args) + 1), tmp)
+            return ExprResult(tmp, is_temp=True)
 
-                # si estamos en función anidada, probar calificada: <outer>.<base_name>
-                qualified = f"{self.fn_stack[-1]}.{base_name}" if self.fn_stack else base_name
+        # --- Caso 3: llamada tipo f(args) (función global o anidada) ---
+        base_name = None
+        if hasattr(ctx.parentCtx, "primaryAtom") and ctx.parentCtx.primaryAtom() and ctx.parentCtx.primaryAtom().Identifier():
+            base_name = ctx.parentCtx.primaryAtom().Identifier().getText()
+        else:
+            # Fallback textual
+            base_name = ctx.getText().split("(", 1)[0]
 
-                # emitimos como calificada si hay anidamiento; si quieres ser más estricto
-                # podrías chequear en symtab si existe; aquí preferimos calificar SOLO si hay anidamiento
-                callee_name = qualified if self.fn_stack else base_name
+        # Calificar si estamos dentro de función anidada
+        callee_name = f"{self.fn_stack[-1]}.{base_name}" if self.fn_stack else base_name
 
-                for a in args:
-                    self.b.tac.emit("param", a.value)
-                tmp = self.b.tmps.new()
-                self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
-                return ExprResult(tmp, is_temp=True)
+        # Emitir params y llamada
+        for a in args:
+            self.b.tac.emit("param", a.value)
+        tmp = self.b.tmps.new()
+        self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
+        return ExprResult(tmp, is_temp=True)
 
-            # 3) Si el LHS no existe (llamada directa tipo foo(...))
-            try:
-                parent_atom = None
-                if hasattr(ctx.parentCtx, "parentCtx") and hasattr(ctx.parentCtx.parentCtx, "primaryAtom"):
-                    parent_atom = ctx.parentCtx.parentCtx.primaryAtom()
-                elif hasattr(ctx.parentCtx, "primaryAtom"):
-                    parent_atom = ctx.parentCtx.primaryAtom()
-
-                if parent_atom and parent_atom.Identifier():
-                    func_name = parent_atom.Identifier().getText()
-                else:
-                    func_name = ctx.getText().split("(", 1)[0]  # fallback textual
-
-                # Calificar si estamos dentro de función anidada
-                callee_name = f"{self.fn_stack[-1]}.{func_name}" if self.fn_stack else func_name
-
-                for a in args:
-                    self.b.tac.emit("param", a.value)
-
-                tmp = self.b.tmps.new()
-                self.b.tac.emit("call", Const(callee_name), Const(len(args)), tmp)
-                return ExprResult(tmp, is_temp=True)
-            except Exception as e:
-                print(f"[WARN] CallExpr fallback: {e}")
-                return self.b.gen_expr_literal(0)
 
 
 
@@ -574,6 +582,52 @@ class TACGen(CompiscriptVisitor):
             off = self.symtab.field_offset(obj_type_name, prop) if obj_type_name else 0
             self.b.gen_field_store(Var(obj_name), off, rhs)
         return rhs
+
+    def visitForeachStatement(self, ctx):
+        """
+        Traduce:
+        for (var x in array) <block>
+        """
+        var_decl = ctx.variableDeclaration()
+        iter_name = var_decl.Identifier().getText()
+        array_expr = self.visit(ctx.expression())
+
+        # contador temporal
+        idx = self.b.tmps.new()
+        self.b.tac.emit(":=", Const(0), None, idx)
+
+        Lcond = self.b.labels.new("Lforeach_cond")
+        Lbody = self.b.labels.new("Lforeach_body")
+        Lend = self.b.labels.new("Lforeach_end")
+
+        self.b.tac.label(Lcond)
+        arr_len = self.b.tmps.new()
+        self.b.tac.emit("len", array_expr.value, None, arr_len)
+
+        cond = self.b.tmps.new()
+        self.b.tac.emit("<", idx, arr_len, cond)
+
+        self.b.tac.emit("ifgoto", cond, None, Lbody)
+        self.b.tac.emit("goto", None, None, Lend)
+
+        self.b.tac.label(Lbody)
+        addr = self.b.tmps.new()
+        self.b.tac.emit("addr_index", array_expr.value, idx, addr)
+
+        elem = self.b.tmps.new()
+        self.b.tac.emit("load", addr, None, elem)
+        self.b._assign(Var(iter_name), ExprResult(elem, is_temp=True))
+
+        # cuerpo del foreach
+        self.visit(ctx.block())
+
+        inc = self.b.tmps.new()
+        self.b.tac.emit("+", idx, Const(1), inc)
+        self.b.tac.emit(":=", inc, None, idx)
+
+        self.b.tac.emit("goto", None, None, Lcond)
+        self.b.tac.label(Lend)
+        return None
 
 
 
