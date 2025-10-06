@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
-from .tac_ir import TACProgram, Operand, Const, Var, Temp, Label
+from .tac_ir import TACProgram, Operand, Const, Var, Temp, Label, Addr
 from .temp_alloc import TempAllocator
 from .label_mgr import LabelManager
 
@@ -276,6 +276,7 @@ class TACBuilder:
         Marca la entrada de una función.
         Nota: 'has_this' y 'params' son informativos para el futuro; el TAC base solo necesita la etiqueta.
         """
+        self.tmps.reset() 
         self.tac.label(Label(f"func_{fname}_entry"))
 
     def gen_fn_end(self, fname: str) -> None:
@@ -403,3 +404,14 @@ class TACBuilder:
 
     def gen_this_field_store(self, field_offset: int, src_expr: ExprResult) -> None:
         self.gen_field_store(Var("this"), field_offset, src_expr)
+
+    def gen_load_addr(self, addr: Addr) -> ExprResult:
+        t = self.tmps.new()
+        self.tac.emit("load", addr, None, t)   # load addr -> t
+        return ExprResult(t, is_temp=True)
+
+    def gen_store_addr(self, addr: Addr, src: ExprResult) -> None:
+        # IMPORTANTE: usa 'addr' como segundo operando (b)
+        self.tac.emit("store", src.value, addr)  # store src, addr
+        if src.is_temp and isinstance(src.value, Temp):
+            self.tmps.free(src.value)
