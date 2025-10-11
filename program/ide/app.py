@@ -72,70 +72,101 @@ def compile_code(source: str):
 
     return reporter, checker.scopes, checker.symtab, parser, tree
 
+def render_scopes(scopes):
+    """
+    Renderiza todos los scopes detectados durante la compilación
+    en formato de tablas Streamlit.
+    """
 
-def render_scope(scope, container, indent=0):
-    pad = " " * (indent * 2)
+    for scope in scopes.stack:
+        st.subheader(f"Scope: {scope.kind}")
 
-    rows = []
-    for _, sym in scope.items():
-        rows.append({
-            "Category": sym.category,
-            "Name": sym.name,
-            "Type": str(sym.type),
-            "Line": getattr(sym, "line", 0),
-            "Col": getattr(sym, "col", 0)
-        })
+        rows = []
+        for _, sym in scope.items():
+            # --- Asignar región lógica ---
+            region = getattr(sym, "region", None)
 
-        # Mostrar parámetros
-        if isinstance(sym, FuncSymbol):
-            for p in sym.params:
-                rows.append({
-                    "Category": "param",
-                    "Name": p.name,
-                    "Type": str(p.type),
-                    "Line": getattr(p, "line", 0),
-                    "Col": getattr(p, "col", 0)
-                })
-            # Mostrar funciones anidadas
-            if hasattr(sym, "nested"):
-                for nname, nsym in sym.nested.items():
+            # Si es constante, variable o función global → marcar manualmente
+            if region is None and scope.kind == "global" and sym.category in ("const", "variable", "function"):
+                region = "global"
+
+            # Si es parámetro con offset, marcar como param
+            if region is None and isinstance(sym, VarSymbol) and getattr(sym, "offset", None) is not None:
+                region = "param"
+
+            # Construir fila base
+            row = {
+                "Category": sym.category,
+                "Name": sym.name,
+                "Type": str(sym.type),
+                "Region": region,
+                "Addr": _fmt_addr(sym),
+                "Offset": getattr(sym, "offset", None),
+                "Line": getattr(sym, "line", 0),
+                "Col": getattr(sym, "col", 0),
+            }
+            rows.append(row)
+
+            # --- Parámetros si es función ---
+            if isinstance(sym, FuncSymbol):
+                for p in sym.params:
                     rows.append({
-                        "Category": "nested function",
-                        "Name": nname,
-                        "Type": str(nsym.type),
-                        "Line": getattr(nsym, "line", 0),
-                        "Col": getattr(nsym, "col", 0)
+                        "Category": "param",
+                        "Name": p.name,
+                        "Type": str(p.type),
+                        "Region": "param" if getattr(p, "offset", None) is not None else None,
+                        "Offset": getattr(p, "offset", None),
+                        "Line": getattr(p, "line", 0),
+                        "Col": getattr(p, "col", 0),
                     })
-                    for np in nsym.params:
-                        rows.append({
-                            "Category": "param",
-                            "Name": np.name,
-                            "Type": str(np.type),
-                            "Line": getattr(np, "line", 0),
-                            "Col": getattr(np, "col", 0)
-                        })
 
-        # Mostrar clases
-        if isinstance(sym, ClassSymbol):
-            for fname, fsym in sym.fields.items():
-                rows.append({
-                    "Category": "field",
-                    "Name": fname,
-                    "Type": str(fsym.type),
-                    "Line": getattr(fsym, "line", 0),
-                    "Col": getattr(fsym, "col", 0)
-                })
-            for mname, msym in sym.methods.items():
-                rows.append({
-                    "Category": "method",
-                    "Name": mname,
-                    "Type": str(msym.type),
-                    "Line": getattr(msym, "line", 0),
-                    "Col": getattr(msym, "col", 0)
-                })
+                # Activation Record (si existe)
+                if getattr(sym, "activation_record", None):
+                    ar = sym.activation_record
+                    with st.expander(f"AR de {sym.name}"):
+                        st.write(
+                            f"**has_this**={ar.has_this}, "
+                            f"**params_size**={ar.params_size}, "
+                            f"**locals_size**={ar.locals_size}, "
+                            f"**frame_size**={ar.frame_size}"
+                        )
 
-    if rows:
-        container.table(rows)
+            # --- Si es clase, listar campos y métodos ---
+            if isinstance(sym, ClassSymbol):
+                if getattr(sym, "fields", None):
+                    st.markdown(f"**Campos de `{sym.name}`**")
+                    st.table([{
+                        "Name": fname,
+                        "Type": str(fsym.type),
+                        "field_offset": getattr(fsym, "field_offset", None),
+                    } for fname, fsym in sym.fields.items()])
+
+                if getattr(sym, "methods", None):
+                    st.markdown(f"**Métodos de `{sym.name}`**")
+                    st.table([{
+                        "Name": mname,
+                        "Type": str(msym.type),
+                        "Params": ", ".join(f"{p.name}: {p.type}" for p in msym.params),
+                    } for mname, msym in sym.methods.items()])
+
+                    # AR por método
+                    for mname, msym in sym.methods.items():
+                        if getattr(msym, "activation_record", None):
+                            ar = msym.activation_record
+                            with st.expander(f"AR de {sym.name}.{mname}"):
+                                st.write(
+                                    f"**has_this**={ar.has_this}, "
+                                    f"**params_size**={ar.params_size}, "
+                                    f"**locals_size**={ar.locals_size}, "
+                                    f"**frame_size**={ar.frame_size}"
+                                )
+
+        # Mostrar tabla final de símbolos del scope
+        if rows:
+            df = pd.DataFrame(rows)
+            st.table(df)
+
+
 
 def get_global_scope(scopes):
     # Devuelve el primer scope de tipo 'global' (o el 0 si no lo encuentra)
@@ -241,79 +272,8 @@ if do_compile:
         st.code(builder.tac.dump(), language="text")
 
     # Tabla de símbolos por scope
-    for scope in scopes.stack:
-        st.subheader(f"Scope: {scope.kind}")
+    render_scopes(scopes)
 
-        rows = []
-        for _, sym in scope.items():
-            row = {
-                "Category": sym.category,
-                "Name": sym.name,
-                "Type": str(sym.type),
-                "Region": getattr(sym, "region", None),
-                "Addr": _fmt_addr(sym),   
-                "Offset": getattr(sym, "offset", None),
-                "Line": getattr(sym, "line", 0),
-                "Col": getattr(sym, "col", 0),
-            }
-            rows.append(row)
-
-            # Parámetros si es función
-            if isinstance(sym, FuncSymbol):
-                for p in sym.params:
-                    rows.append({
-                        "Category": "param",
-                        "Name": p.name,
-                        "Type": str(p.type),
-                        "Region": "param" if getattr(p, "offset", None) is not None else None,
-                        "Offset": getattr(p, "offset", None),
-                        "Line": getattr(p, "line", 0),
-                        "Col": getattr(p, "col", 0),
-                    })
-
-                # Activation Record (si existe)
-                if getattr(sym, "activation_record", None):
-                    ar = sym.activation_record
-                    with st.expander(f"AR de {sym.name}"):
-                        st.write(
-                            f"**has_this**={ar.has_this}, "
-                            f"**params_size**={ar.params_size}, "
-                            f"**locals_size**={ar.locals_size}, "
-                            f"**frame_size**={ar.frame_size}"
-                        )
-
-            # Si es clase, listar campos y métodos (y AR de métodos si lo hay)
-            if isinstance(sym, ClassSymbol):
-                if getattr(sym, "fields", None):
-                    st.markdown(f"**Campos de `{sym.name}`**")
-                    st.table([{
-                        "Name": fname,
-                        "Type": str(fsym.type),
-                        "field_offset": getattr(fsym, "field_offset", None),
-                    } for fname, fsym in sym.fields.items()])
-
-                if getattr(sym, "methods", None):
-                    st.markdown(f"**Métodos de `{sym.name}`**")
-                    st.table([{
-                        "Name": mname,
-                        "Type": str(msym.type),
-                        "Params": ", ".join(f"{p.name}: {p.type}" for p in msym.params),
-                    } for mname, msym in sym.methods.items()])
-
-                    # AR por método
-                    for mname, msym in sym.methods.items():
-                        if getattr(msym, "activation_record", None):
-                            ar = msym.activation_record
-                            with st.expander(f"AR de {sym.name}.{mname}"):
-                                st.write(
-                                    f"**has_this**={ar.has_this}, "
-                                    f"**params_size**={ar.params_size}, "
-                                    f"**locals_size**={ar.locals_size}, "
-                                    f"**frame_size**={ar.frame_size}"
-                                )
-
-        if rows:
-            st.table(rows)
 
     # mostrar parámetros de cada función declarada en el scope global
     # ---- Mostrar clases y sus miembros (en el global)

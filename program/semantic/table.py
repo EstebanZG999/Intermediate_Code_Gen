@@ -11,18 +11,29 @@ def print_scope(scope: Scope, indent=0):
 
     for name, sym in scope.items():
         row = f"{pad}- {sym.category:<8} {sym.name:<12} : {sym.type}"
+
+        # Mostrar línea y columna si existen
         if hasattr(sym, "line") and hasattr(sym, "col"):
             row += f" (line {getattr(sym, 'line', 0)}, col {getattr(sym, 'col', 0)})"
-        # NUEVO: región/offset si aplica
-        if hasattr(sym, "region") and getattr(sym, "region", None) is not None:
-            row += f"   [region={sym.region}"
-            if hasattr(sym, "offset") and getattr(sym, "offset", None) is not None:
-                row += f", offset={sym.offset}"
+
+        # NUEVO: región/offset si aplica o si es global const/variable
+        region = getattr(sym, "region", None)
+
+        # Si es una constante o variable global, marcar manualmente como global
+        if region is None and scope.kind == "global" and sym.category in ("const", "variable"):
+            region = "global"
+
+        if region is not None:
+            row += f"   [region={region}"
+            offset = getattr(sym, "offset", None)
+            if offset is not None:
+                row += f", offset={offset}"
             row += "]"
+
         print(row)
 
+        # --- Funciones ---
         if isinstance(sym, FuncSymbol):
-            # helper para firmar offsets como fp+2 / fp-1
             def _fmt_off(off):
                 return f"{'+' if off is not None and off >= 0 else ''}{off}"
 
@@ -36,7 +47,6 @@ def print_scope(scope: Scope, indent=0):
             # ActivationRecord (si existe)
             ar = getattr(sym, "activation_record", None)
             if ar is not None:
-                # si tu ActivationRecord ya tiene @property frame_size, esto funciona directo
                 fs = getattr(ar, "frame_size", 2 + (1 if ar.has_this else 0) + ar.params_size + ar.locals_size)
                 print(f"{pad}    AR: has_this={ar.has_this}, params_size={ar.params_size}, locals_size={ar.locals_size}, frame_size={fs}")
 
@@ -47,6 +57,7 @@ def print_scope(scope: Scope, indent=0):
                     for np in nsym.params:
                         print(f"{pad}        param {np.name} : {np.type} (index {np.index})")
 
+        # --- Clases ---
         if isinstance(sym, ClassSymbol):
             for fname, fsym in sym.fields.items():
                 extra = ""
@@ -56,11 +67,12 @@ def print_scope(scope: Scope, indent=0):
 
             for mname, msym in sym.methods.items():
                 print(f"{pad}    method {mname} : {msym.type}")
-                # Detalle de AR del método, si existe
                 ar = getattr(msym, "activation_record", None)
                 if ar is not None:
                     fs = getattr(ar, "frame_size", 2 + (1 if ar.has_this else 0) + ar.params_size + ar.locals_size)
                     print(f"{pad}        AR: has_this={ar.has_this}, params_size={ar.params_size}, locals_size={ar.locals_size}, frame_size={fs}")
+
+
 
 def print_symbol_table(stack: ScopeStack):
     if not stack.stack:

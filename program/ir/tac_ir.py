@@ -61,7 +61,6 @@ class Quadruple:
         if self.op == "param":
             return f"param {self.a}"
         if self.op == "call":
-            # mejora: si no hay destino, no imprimas "-> None"
             return (f"call {self.a}, nargs={self.b}"
                     if self.dst is None
                     else f"call {self.a}, nargs={self.b} -> {self.dst}")
