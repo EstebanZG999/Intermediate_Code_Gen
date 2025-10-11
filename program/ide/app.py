@@ -115,10 +115,12 @@ def render_scopes(scopes):
                         "Name": p.name,
                         "Type": str(p.type),
                         "Region": "param" if getattr(p, "offset", None) is not None else None,
+                        "Addr": _fmt_addr(p),
                         "Offset": getattr(p, "offset", None),
                         "Line": getattr(p, "line", 0),
                         "Col": getattr(p, "col", 0),
                     })
+
 
                 # Activation Record (si existe)
                 if getattr(sym, "activation_record", None):
@@ -209,10 +211,30 @@ def render_symbols(scopes, st):
 def _fmt_addr(sym):
     off = getattr(sym, "offset", None)
     reg = getattr(sym, "region", None)
-    if off is None or reg not in ("param","local","this"):
-        return ""
-    sign = "+" if int(off) >= 0 else ""
-    return f"[fp{sign}{int(off)}]"
+
+    # Asegurar que region esté actualizado
+    if reg is None and hasattr(sym, "category"):
+        if sym.category in ("const", "variable", "function"):
+            reg = "global"
+
+    # --- Mostrar dirección simbólica para globales ---
+    if reg == "global":
+        return "[gp]"  # global pointer simbólico
+
+    # --- Direcciones para locales, parámetros y this ---
+    if reg in ("param", "local", "this") and off is not None:
+        try:
+            val = float(off)
+            sign = "+" if val >= 0 else ""
+            return f"[fp{sign}{int(val)}]"
+        except (ValueError, TypeError):
+            pass
+
+    # Si no aplica, devolver "-" en lugar de vacío (evita <NA>)
+    return "-"
+
+
+
 
 
 st.set_page_config(page_title="Compiscript IDE", layout="wide")

@@ -267,9 +267,7 @@ class TACBuilder:
         else:
             self.tac.emit("ret")
 
-    # ============================
-    # FUNCIONES Y LLAMADAS (Persona C)
-    # ============================
+    
 
     def gen_fn_begin(self, fname: str, has_this: bool = False, params: list[str] | None = None) -> None:
         """
@@ -295,7 +293,6 @@ class TACBuilder:
         """
         for a in args:
             self.tac.emit("param", a.value)
-            # libera temporales de argumentos después de encolarlos
             if a.is_temp and isinstance(a.value, Temp):
                 self.tmps.free(a.value)
 
@@ -310,9 +307,7 @@ class TACBuilder:
         if expr_res and expr_res.is_temp and isinstance(expr_res.value, Temp):
             self.tmps.free(expr_res.value)
     
-    # ============================
-    # MEMORIA / ARREGLOS (Persona C)
-    # ============================
+    
 
     def gen_array_load(self, base_operand: Operand, idx_expr: ExprResult) -> ExprResult:
         """
@@ -345,7 +340,6 @@ class TACBuilder:
         self.tac.emit("addr_index", base_operand, idx_expr.value, taddr)
         self.tac.emit("store", src_expr.value, taddr)
 
-        # liberar temporales
         if idx_expr.is_temp and isinstance(idx_expr.value, Temp):
             self.tmps.free(idx_expr.value)
         if src_expr.is_temp and isinstance(src_expr.value, Temp):
@@ -366,9 +360,7 @@ class TACBuilder:
         """
         self.gen_array_store(Var(base_var_name), idx_expr, src_expr)
 
-    # ============================
-    # OBJETOS / CAMPOS (Persona C)
-    # ============================
+    
 
     def gen_field_load(self, base_operand: Operand, field_offset: int) -> ExprResult:
         """

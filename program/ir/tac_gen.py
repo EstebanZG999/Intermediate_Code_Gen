@@ -12,13 +12,11 @@ class TACGen(CompiscriptVisitor):
         self.b = builder
         self.fn_stack: list[str] = []
 
-    # ---------- Programa ----------
     def visitProgram(self, ctx: CompiscriptParser.ProgramContext):
         for st in ctx.statement():
             self.visit(st)
         return None
 
-    # === helper: valor de una variable (lee del frame si aplica)
     def _current_fn_sym(self):
         """Devuelve el FuncSymbol de la función/metodo actual usando self.fn_stack."""
         if not self.fn_stack:
@@ -53,9 +51,7 @@ class TACGen(CompiscriptVisitor):
         # global/const u otros símbolos
         return ExprResult(Var(name), is_temp=False)
 
-    # ---------- Literales / Identificadores ----------
     def visitLiteralExpr(self, ctx: CompiscriptParser.LiteralExprContext):
-        # *** NUEVO: manejar arrays ***
         if hasattr(ctx, "arrayLiteral") and ctx.arrayLiteral():
             return self.visit(ctx.arrayLiteral())
 
@@ -628,47 +624,64 @@ class TACGen(CompiscriptVisitor):
     def visitForeachStatement(self, ctx):
         """
         Traduce:
-        for (var x in array) <block>
+        foreach (x in array) <block>
         """
-        var_decl = ctx.variableDeclaration()
-        iter_name = var_decl.Identifier().getText()
+        iter_name = ctx.Identifier().getText()
         array_expr = self.visit(ctx.expression())
 
-        # contador temporal
+        # idx = 0
         idx = self.b.tmps.new()
         self.b.tac.emit(":=", Const(0), None, idx)
 
+        # etiquetas
         Lcond = self.b.labels.new("Lforeach_cond")
         Lbody = self.b.labels.new("Lforeach_body")
-        Lend = self.b.labels.new("Lforeach_end")
+        Lend  = self.b.labels.new("Lforeach_end")
 
         self.b.tac.label(Lcond)
+
+        # len(array)
         arr_len = self.b.tmps.new()
         self.b.tac.emit("len", array_expr.value, None, arr_len)
 
+        # cond = idx < len(array)
         cond = self.b.tmps.new()
         self.b.tac.emit("<", idx, arr_len, cond)
-
         self.b.tac.emit("ifgoto", cond, None, Lbody)
         self.b.tac.emit("goto", None, None, Lend)
 
+        # marcar inicio del cuerpo
         self.b.tac.label(Lbody)
+
+        # registrar etiquetas de control (para break/continue)
+        self.b.labels.push_loop(continue_lbl=Lcond, break_lbl=Lend)
+
+        # addr = &array[idx]
         addr = self.b.tmps.new()
         self.b.tac.emit("addr_index", array_expr.value, idx, addr)
-
         elem = self.b.tmps.new()
         self.b.tac.emit("load", addr, None, elem)
+
+        # n = elem
         self.b._assign(Var(iter_name), ExprResult(elem, is_temp=True))
 
         # cuerpo del foreach
         self.visit(ctx.block())
 
+        # idx = idx + 1
         inc = self.b.tmps.new()
         self.b.tac.emit("+", idx, Const(1), inc)
         self.b.tac.emit(":=", inc, None, idx)
 
+        # volver a cond
         self.b.tac.emit("goto", None, None, Lcond)
+
+        # sacar loop del stack
+        self.b.labels.pop_loop()
+
+        # etiqueta de fin
         self.b.tac.label(Lend)
+
         return None
 
 
